@@ -1259,6 +1259,35 @@ def print_summary(data, xml_str: Optional[str] = None):
         print(xml_str)
 
     print(f"{C.BOLD}{'='*60}{C.RESET}")
+def auto_detect_technique(
+    engine: Engine,
+    all_params: list[str],
+    force_technique: Optional[str] = None,
+) -> Optional[InjectionContext]:
+    """
+    Try techniques in order: normal → boolean → time-based.
+    Return the first that works.
+    """
+    techniques = ["normal", "boolean", "time"] if not force_technique else [force_technique]
+    info(f"Auto-detecting injection technique (order: {' → '.join(techniques)})")
+    print()
+
+    for tech in techniques:
+        ctx = None
+        if tech == "normal":
+            ctx = detect_normal(engine, all_params, all_params)
+        elif tech == "boolean":
+            ctx = detect_boolean(engine, all_params)
+        elif tech == "time":
+            ctx = detect_time_based(engine, all_params)
+
+        if ctx:
+            print()
+            success(f"Confirmed technique: {C.BOLD}{ctx.technique.upper()}{C.RESET}")
+            return ctx
+        print()
+
+    return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
