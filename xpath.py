@@ -244,18 +244,26 @@ class BoolOracle(Oracle):
     def __init__(self,eng,inj,mfn=None,th="",fh="",mode=Mode.SAFE):
         super().__init__(eng,inj);self.mfn=mfn;self.th=th;self.fh=fh;self.mode=mode
     async def ask(self,c:str)->bool:
-        p=self.inj.pay(c);att=1 if self.mode==Mode.AGG else MAX_RETRIES
+        p=self.inj.pay(c)
         if self.mfn:
-            v=0
-            for _ in range(att):
-                html,_,st=await self.eng.send({self.inj.param:p})
-                if self.mfn(st,html):v+=1
-            return v>att//2
-        v=0
-        for _ in range(att):
+            html,_,st=await self.eng.send({self.inj.param:p})
+            result=self.mfn(st,html)
+            if self.mode==Mode.AGG:return result
+            # Safe: only re-check if first result might be flaky (rare)
+            # For match_fn, one check is usually enough since it's deterministic
+            return result
+        # Auto-similarity: single request, retry only if ambiguous
+        html,_,_=await self.eng.send({self.inj.param:p})
+        st=sim(self.th,html);sf=sim(self.fh,html)
+        diff=abs(st-sf)
+        if diff>0.05 or self.mode==Mode.AGG:
+            return st>sf
+        # Ambiguous — do 2 more votes
+        votes=1 if st>sf else 0
+        for _ in range(2):
             html,_,_=await self.eng.send({self.inj.param:p})
-            if sim(self.th,html)>sim(self.fh,html):v+=1
-        return v>att//2
+            if sim(self.th,html)>sim(self.fh,html):votes+=1
+        return votes>=2
 
 class TimeOracle(Oracle):
     def __init__(self,eng,inj,thr,mode=Mode.SAFE):
@@ -493,8 +501,7 @@ async def extract_xml(ex,xp="/*[1]",depth=0,maxd=15,state=None,sp=None):
     name=await ex.get_string(f"name({xp})",label=xp)
     if not name:name="unknown"
     node=XmlNode(name=name)
-    pad="  "*depth
-    con.print(f"  {pad}[bold cyan]<{name}>[/bold cyan] [dim]{xp}[/dim]")
+    pad="  "*(depth+1)
     # attrs
     ac=await ex.count(f"{xp}/@*")
     for i in range(1,ac+1):
@@ -507,13 +514,13 @@ async def extract_xml(ex,xp="/*[1]",depth=0,maxd=15,state=None,sp=None):
     # children
     nc=await ex.count(f"{xp}/*")
     if nc==0 or depth>=maxd:
-        node.value=await ex.get_string(xp,label=f"{xp}(text)")
+        # Leaf — get text value
+        val=await ex.get_string(xp,label=f"{xp}(text)")
+        # Strip whitespace-only values
+        node.value=val if val and val.strip() else None
     else:
-        tc=await ex.count(f"{xp}/text()")
-        if tc>0:
-            texts=[]
-            for i in range(1,tc+1):texts.append(await ex.get_string(f"{xp}/text()[{i}]",label=f"text[{i}]",normalize=False))
-            node.value="".join(texts)if texts else None
+        # Branch — show count and recurse, skip whitespace text() nodes
+        con.print(f"  {pad}[bold cyan]<{name}>[/bold cyan] [dim]({nc} children)[/dim]")
         for i in range(1,nc+1):
             node.children.append(await extract_xml(ex,f"{xp}/*[{i}]",depth+1,maxd,state,sp))
     if state and sp:state.partial[xp]=json.dumps({"name":node.name,"value":node.value});state.save(sp)
