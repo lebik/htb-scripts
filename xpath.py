@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-xcat-ng — Modern XPath Injection Exploitation Toolkit
+xcat-ng — Modern XPath Injection Exploitation Toolkit (rewrite)
 
 Dependencies:
     pip install httpx rich prompt_toolkit aiohttp
@@ -15,6 +15,7 @@ import contextlib
 import difflib
 import enum
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -404,14 +405,29 @@ class HTTPEngine:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            transport = httpx.AsyncHTTPTransport(retries=2)
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.config.timeout),
-                verify=self.config.verify_ssl,
-                transport=transport,
-                proxy=self.config.proxy,
-                follow_redirects=True,
-            )
+            kwargs: dict[str, Any] = {
+                "timeout": httpx.Timeout(self.config.timeout),
+                "verify": self.config.verify_ssl,
+                "follow_redirects": True,
+            }
+
+            # httpx >= 0.28 uses 'proxy' (singular); older uses 'proxies' (dict)
+            if self.config.proxy:
+                init_params = inspect.signature(httpx.AsyncClient.__init__).parameters
+                if "proxy" in init_params:
+                    kwargs["proxy"] = self.config.proxy
+                elif "proxies" in init_params:
+                    kwargs["proxies"] = self.config.proxy
+                else:
+                    # Fallback: set on transport
+                    kwargs["transport"] = httpx.AsyncHTTPTransport(
+                        retries=2, proxy=self.config.proxy
+                    )
+
+            if "transport" not in kwargs:
+                kwargs["transport"] = httpx.AsyncHTTPTransport(retries=2)
+
+            self._client = httpx.AsyncClient(**kwargs)
         return self._client
 
     async def close(self):
