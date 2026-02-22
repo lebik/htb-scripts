@@ -15,7 +15,6 @@ import contextlib
 import difflib
 import enum
 import hashlib
-import inspect
 import json
 import math
 import os
@@ -405,29 +404,26 @@ class HTTPEngine:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            kwargs: dict[str, Any] = {
-                "timeout": httpx.Timeout(self.config.timeout),
-                "verify": self.config.verify_ssl,
-                "follow_redirects": True,
-            }
-
-            # httpx >= 0.28 uses 'proxy' (singular); older uses 'proxies' (dict)
+            # Build transport – proxy goes here to avoid httpx version issues
+            transport_kwargs: dict[str, Any] = {"retries": 2}
             if self.config.proxy:
-                init_params = inspect.signature(httpx.AsyncClient.__init__).parameters
-                if "proxy" in init_params:
-                    kwargs["proxy"] = self.config.proxy
-                elif "proxies" in init_params:
-                    kwargs["proxies"] = self.config.proxy
-                else:
-                    # Fallback: set on transport
-                    kwargs["transport"] = httpx.AsyncHTTPTransport(
-                        retries=2, proxy=self.config.proxy
-                    )
+                try:
+                    transport_kwargs["proxy"] = self.config.proxy
+                except TypeError:
+                    pass  # very old httpx without proxy on transport
 
-            if "transport" not in kwargs:
-                kwargs["transport"] = httpx.AsyncHTTPTransport(retries=2)
+            try:
+                transport = httpx.AsyncHTTPTransport(**transport_kwargs)
+            except TypeError:
+                # If proxy kwarg not supported on transport either, ignore it
+                transport = httpx.AsyncHTTPTransport(retries=2)
 
-            self._client = httpx.AsyncClient(**kwargs)
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.config.timeout),
+                verify=self.config.verify_ssl,
+                transport=transport,
+                follow_redirects=True,
+            )
         return self._client
 
     async def close(self):
@@ -679,8 +675,12 @@ class BaseOracle:
 
 class BooleanOracle(BaseOracle):
     """
-    Boolean-based oracle: interprets response similarity to baseline
-    as true/false.
+    Boolean-based oracle: determines true/false by comparing the response
+    against known true_html and false_html reference samples captured
+    during injection detection.
+
+    With --true-string / --true-code a user-supplied match function is used
+    instead, which is always more reliable.
     """
 
     def __init__(
@@ -688,14 +688,14 @@ class BooleanOracle(BaseOracle):
         engine: HTTPEngine,
         injection: Injection,
         match_fn: Optional[Callable[[int, str], bool]] = None,
-        baseline_html: str = "",
-        true_sim_threshold: float = 0.85,
+        true_html: str = "",
+        false_html: str = "",
         mode: Mode = Mode.SAFE,
     ):
         super().__init__(engine, injection)
         self.match_fn = match_fn
-        self.baseline_html = baseline_html
-        self.true_sim_threshold = true_sim_threshold
+        self.true_html = true_html
+        self.false_html = false_html
         self.mode = mode
 
     async def ask(self, condition: str) -> bool:
@@ -703,7 +703,7 @@ class BooleanOracle(BaseOracle):
         attempts = 1 if self.mode == Mode.AGGRESSIVE else MAX_RETRIES
 
         if self.match_fn:
-            # User provided explicit match function
+            # User provided explicit match function — most reliable
             votes = 0
             for _ in range(attempts):
                 html, _, status = await self.engine.send({self.injection.param: payload})
@@ -713,12 +713,14 @@ class BooleanOracle(BaseOracle):
             self.confidence.record(result)
             return result
 
-        # Auto-similarity mode
+        # Auto-similarity: compare response to both true and false references
+        # and pick whichever it's closer to
         votes = 0
         for _ in range(attempts):
             html, _, _ = await self.engine.send({self.injection.param: payload})
-            sim = similarity(self.baseline_html, html)
-            if sim > self.true_sim_threshold:
+            sim_true = similarity(self.true_html, html)
+            sim_false = similarity(self.false_html, html)
+            if sim_true >= sim_false:
                 votes += 1
         result = votes > attempts // 2
         self.confidence.record(result)
@@ -821,22 +823,27 @@ async def detect_injection_type(
     param: str,
     working_value: str,
     match_fn: Optional[Callable] = None,
-) -> Optional[Injection]:
+) -> Optional[Tuple[Injection, str, str]]:
     """
     Try all injection templates against a single parameter.
-    Returns the first matching Injection or None.
+    Returns (Injection, true_html, false_html) or None.
     """
     # Get baseline
     baseline_html, _, baseline_status = await engine.send({})
 
     for name, example, test_pairs, payload_tpl in INJECTION_TEMPLATES:
         all_ok = True
+        last_true_html = ""
+        last_false_html = ""
         for true_tpl, false_tpl in test_pairs:
             true_payload = true_tpl.replace("{W}", working_value)
             false_payload = false_tpl.replace("{W}", working_value)
 
             true_html, _, true_status = await engine.send({param: true_payload})
             false_html, _, false_status = await engine.send({param: false_payload})
+
+            last_true_html = true_html
+            last_false_html = false_html
 
             if match_fn:
                 true_match = match_fn(true_status, true_html)
@@ -866,13 +873,14 @@ async def detect_injection_type(
                     break
 
         if all_ok:
-            return Injection(
+            inj = Injection(
                 name=name,
                 example=example,
                 payload_template=payload_tpl,
                 param=param,
                 working_value=working_value,
             )
+            return inj, last_true_html, last_false_html
 
     return None
 
@@ -958,13 +966,14 @@ async def auto_detect(
 
         # Boolean-based
         if tech in (Technique.AUTO, Technique.BOOLEAN):
-            inj = await detect_injection_type(engine, param, working_value, match_fn)
-            if inj:
+            det_result = await detect_injection_type(engine, param, working_value, match_fn)
+            if det_result:
+                inj, true_html, false_html = det_result
                 console.print(f"  [green]✓[/green] Boolean injection: [bold]{inj.name}[/bold] on [yellow]{param}[/yellow]")
-                baseline_html, _, _ = await engine.send({})
                 oracle = BooleanOracle(
                     engine, inj, match_fn,
-                    baseline_html=baseline_html,
+                    true_html=true_html,
+                    false_html=false_html,
                     mode=config.mode,
                 )
                 return Technique.BOOLEAN, oracle, None
