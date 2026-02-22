@@ -378,24 +378,31 @@ class Ctx:
 
 async def _send(ctx: Ctx, param_overrides: Dict[str, str]) -> Tuple[int, str]:
     """Send HTTP request with given parameter values substituted in."""
-    q = dict(ctx.req.params)
-    b = dict(ctx.req.body)
+    q = dict(ctx.req.params)   # query string params
+    b = dict(ctx.req.body)     # POST body params
+
+    # Apply overrides to the correct bucket
     for k, v in param_overrides.items():
-        if k in q:  q[k] = v
-        else:       b[k] = v
+        if k in b:        b[k] = v   # body param
+        elif k in q:      q[k] = v   # query param
+        elif b:           b[k] = v   # request has body → put there
+        else:             q[k] = v   # GET-style → put in query
 
     if ctx.req.method.upper() in ("GET", "DELETE", "HEAD"):
         kw = dict(params=q, headers=ctx.req.headers)
     else:
-        merged = {**q, **b}
-        kw = dict(data=merged, headers=ctx.req.headers)
+        # POST/PUT: query params stay in URL, body params go in data
+        kw = dict(params=q, data=b, headers=ctx.req.headers)
 
     if ctx.tamper_fn:
         ctx.tamper_fn(ctx, kw)
 
+    dbg(f"→ {ctx.req.method} {ctx.req.url}  q={q}  body={b}")
+
     async with ctx._sem:
         try:
             r = await ctx._client.request(ctx.req.method, ctx.req.url, **kw)
+            dbg(f"← {r.status_code}  len={len(r.text)}  snippet={r.text[:120]!r}")
             return r.status_code, r.text
         except Exception as e:
             dbg(f"request error: {e}")
